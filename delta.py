@@ -116,6 +116,8 @@ DEFAULT_CONFIG: dict = {
     "snapshot_commands": [],
 
     # Logging
+    "default_patch_format":    "",   # display_format fallback for all patches
+    "default_baseline_format": "",   # display_format fallback for all baselines
     "log_enabled":  True,
     "log_dir":      "",   # empty = {work-dir}/logs
     "log_filename": "{cmd}_{timestamp}_{result}.log",  # {cmd} {timestamp} {result}
@@ -185,25 +187,43 @@ _log_handle:          object       = None
 _log_tmp_path: Path | None         = None
 
 
-def open_log(cfg: dict, paths: dict, cmd: str) -> None:
-    global _log_handle, _log_tmp_path
+_log_silent: bool = False  # when True: log file is written but not announced
+
+
+def open_log(cfg: dict, paths: dict, cmd: str,
+             subcmd: str | None = None, silent: bool = False) -> None:
+    global _log_handle, _log_tmp_path, _log_silent
     if not cfg.get("log_enabled"):
         return
+    _log_silent = silent
     log_dir = Path(cfg["log_dir"]) if cfg.get("log_dir") else paths["logs"]
     log_dir.mkdir(parents=True, exist_ok=True)
     ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pattern = cfg.get("log_filename", "{cmd}_{timestamp}_{result}.log")
-    name    = pattern.replace("{cmd}", cmd).replace("{timestamp}", ts) \
-                     .replace("{result}", "__RESULT__")
+    # Build log name: {timestamp}_{cmd}[_{subcmd}]_{result}.log
+    # Uses log_filename from config if set, otherwise the default format above.
+    default_pattern = cfg.get("log_filename", "")
+    if default_pattern:
+        parts = [cmd]
+        if subcmd:
+            parts.append(subcmd)
+        label = "_".join(parts)
+        name  = default_pattern.replace("{cmd}", label)                                .replace("{timestamp}", ts)                                .replace("{result}", "__RESULT__")
+    else:
+        parts = [ts, cmd]
+        if subcmd:
+            parts.append(subcmd)
+        parts.append("__RESULT__")
+        name = "_".join(parts) + ".log"
     _log_tmp_path = log_dir / name
     _log_handle   = open(_log_tmp_path, "w", encoding="utf-8")
     sys.stdout    = _Tee(sys.__stdout__, _log_handle)
     sys.stderr    = _Tee(sys.__stderr__, _log_handle)
-    print(f"📝  Logging to: {_log_tmp_path}")
+    if not silent:
+        print(f"📝  Logging to: {_log_tmp_path}")
 
 
 def close_log(result: str = "success") -> None:
-    global _log_handle, _log_tmp_path
+    global _log_handle, _log_tmp_path, _log_silent
     if not _log_handle:
         return
     sys.stdout = sys.__stdout__
@@ -213,9 +233,10 @@ def close_log(result: str = "success") -> None:
     if _log_tmp_path and _log_tmp_path.exists():
         final = _log_tmp_path.parent / _log_tmp_path.name.replace("__RESULT__", result)
         _log_tmp_path.rename(final)
-        if final != _log_tmp_path:
+        if not _log_silent and final != _log_tmp_path:
             print(f"📝  Log saved: {final}")
     _log_tmp_path = None
+    _log_silent   = False
 
 
 def check_log_size(cfg: dict, paths: dict) -> None:
@@ -872,11 +893,23 @@ def cmd_snapshot(args, paths: dict, cfg: dict) -> None:
                          if args.force or not (baseline / d.lstrip("/")).exists()]
     needs_ssh = bool(dirs_to_fetch)
 
+    # Confirm overwrite if baseline exists and we are about to re-fetch
+    if needs_ssh and existing_meta and not args.force:
+        if not getattr(args, "yes", False):
+            try:
+                _ans = input(f"Baseline '{baseline_name}' already exists. Overwrite? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                _ans = ""
+            if _ans != "y":
+                print("Aborted.")
+                return
+
     # Only resolve (and require) source host when SSH is actually needed
     host = resolve_source(cfg, args.host) if needs_ssh else (
         args.host or cfg.get("source_host") or cfg.get("default_host") or "local"
     )
-    print(f"\n📸  Snapshot  →  baseline '{baseline_name}'")
+    _action = "Updating" if existing_meta else "Creating new"
+    print(f"\n📸  {_action} baseline '{baseline_name}'")
     if needs_ssh:
         print(f"    Source      : {host}")
     print(f"    Directories : {watched}")
@@ -979,11 +1012,16 @@ def cmd_diff(args, paths: dict, cfg: dict) -> None:
     if not paths["baseline"].exists():
         bname = paths["baseline"].name
         print(f"❌  Baseline '{bname}' not found.")
+        _br   = paths["baselines_root"]
+        available = sorted(b.name for b in _br.iterdir()
+                           if b.is_dir()) if _br.exists() else []
+        if available: print(f"    Available baselines: {available}")
         print(f"    delta snapshot --baseline {bname}")
         sys.exit(1)
 
     host       = resolve_source(cfg, args.host)
     patch_name = paths["patch"].name
+    _dry_no_patch = args.dry_run and not args.patch
 
     # Read watched_dirs and excludes from baseline meta
     bl_meta  = read_baseline_meta(paths)
@@ -997,6 +1035,7 @@ def cmd_diff(args, paths: dict, cfg: dict) -> None:
 
     current = Path(args.dir) if args.dir \
         else Path(cfg["current_dir"]) if cfg.get("current_dir") \
+        else (paths["tmp"] / "diff_preview") if _dry_no_patch \
         else paths["current"]
 
     def _do_diff(sock: str | None) -> None:
@@ -1086,8 +1125,18 @@ def cmd_diff(args, paths: dict, cfg: dict) -> None:
                     sys.exit(1)
 
         # Build patch
-        print(f"\n📦  Building patch '{patch_name}'...")
-        patch = paths["patch"]
+        patch         = paths["patch"]
+        _is_new_patch = not (patch / "manifest.json").exists()
+        if not _is_new_patch and not getattr(args, "yes", False):
+            try:
+                _ans = input(f"Patch '{patch_name}' already exists. Overwrite? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                _ans = ""
+            if _ans != "y":
+                print("Aborted.")
+                return
+        _action = "Creating" if _is_new_patch else "Overwriting"
+        print(f"\n📦  {_action} patch '{patch_name}'...")
         for f in ["changes.tar.gz", "manifest.json"]:
             (patch / f).unlink(missing_ok=True)
         patch.mkdir(parents=True, exist_ok=True)
@@ -1132,18 +1181,23 @@ def cmd_diff(args, paths: dict, cfg: dict) -> None:
         if current.exists():
             shutil.rmtree(current)
         current.mkdir(parents=True)
-        with ssh_master(cfg, host) as sock:
-            for d in watched:
-                rsync_pull(cfg, host, d, current / d.lstrip("/"), excludes, sock)
-            _do_diff(sock)
+        try:
+            with ssh_master(cfg, host) as sock:
+                for d in watched:
+                    rsync_pull(cfg, host, d, current / d.lstrip("/"), excludes, sock)
+                _do_diff(sock)
+        finally:
+            if _dry_no_patch and current.exists():
+                shutil.rmtree(current)
     else:
         if not current.exists():
             has_cmds = bool(cfg.get("pre_commands") or cfg.get("post_commands"))
             if has_cmds:
-                print(f"\n📋  --skip-fetch + no current dir — commands-only patch")
+                print(f"\n📋  --skip-fetch: no files downloaded yet — commands-only patch")
                 _do_diff(sock=None)
             else:
-                print(f"❌  --skip-fetch: {current} does not exist.")
+                print(f"❌  --skip-fetch: no previously downloaded files found.")
+                print(f"    Run without --skip-fetch to download first.")
                 sys.exit(1)
         else:
             print(f"\n🔍  Using already-fetched files from {current}")
@@ -1190,8 +1244,10 @@ def cmd_patch(args, paths: dict, cfg: dict) -> None:
             print(f"❌  Patch '{args.source}' not found.")
             sys.exit(1)
         if dst.exists():
-            print(f"❌  Patch '{args.dest}' already exists.")
-            sys.exit(1)
+            if not getattr(args, "force", False):
+                print(f"❌  Patch '{args.dest}' already exists. Use -f to overwrite.")
+                sys.exit(1)
+            shutil.rmtree(dst)
         shutil.copytree(src, dst, ignore=shutil.ignore_patterns("current"))
         mf = dst / "manifest.json"
         if mf.exists():
@@ -1209,8 +1265,10 @@ def cmd_patch(args, paths: dict, cfg: dict) -> None:
             print(f"❌  Patch '{args.old_name}' not found.")
             sys.exit(1)
         if dst.exists():
-            print(f"❌  Patch '{args.new_name}' already exists.")
-            sys.exit(1)
+            if not getattr(args, "force", False):
+                print(f"❌  Patch '{args.new_name}' already exists. Use -f to overwrite.")
+                sys.exit(1)
+            shutil.rmtree(dst)
         src.rename(dst)
         mf = dst / "manifest.json"
         if mf.exists():
@@ -1339,8 +1397,8 @@ def _list_patches(paths: dict, cfg: dict, verbose: bool = False) -> None:
         m      = json.loads((p / "manifest.json").read_text())
         ts     = m.get("created", "?")[:19]
         is_def = default and p.name == default
-        custom = ("  " + render_format(m["display_format"], m)
-                  if m.get("display_format") else "")
+        fmt    = m.get("display_format") or cfg.get("default_patch_format", "")
+        custom = ("  " + render_format(fmt, m) if fmt else "")
         flag   = "  ← default" if is_def else ""
         print(f"  {p.name:<20}  {ts}{custom}{flag}")
         if verbose:
@@ -1430,8 +1488,8 @@ def _list_baselines(paths: dict, cfg: dict, verbose: bool = False) -> None:
         if mf.exists():
             m       = json.loads(mf.read_text())
             ts      = m.get("time", "?")[:19]
-            custom  = ("  " + render_format(m["display_format"], m)
-                       if m.get("display_format") else "")
+            fmt     = m.get("display_format") or cfg.get("default_baseline_format", "")
+            custom  = ("  " + render_format(fmt, m) if fmt else "")
             pending = "  ⚠️  pending sync" if m.get("pending_sync") else ""
             print(f"  {b.name:<20}  {ts}{custom}{pending}{flag}")
             if verbose:
@@ -1950,6 +2008,8 @@ def cmd_config(args, paths: dict, cfg: dict) -> None:
     _set("default_chown",    getattr(args, "set_default_chown",    None))
     _set("current_dir",      getattr(args, "set_current_dir",      None))
     _set("remote_tmp_path",  getattr(args, "set_remote_tmp_path",  None))
+    _set("default_patch_format",    getattr(args, "set_default_patch_format",    None))
+    _set("default_baseline_format", getattr(args, "set_default_baseline_format", None))
     _set("log_enabled",      getattr(args, "log_enable",           None), lambda _: True)
     _set("log_enabled",      getattr(args, "log_disable",          None), lambda _: False)
     _set("log_dir",          getattr(args, "set_log_dir",          None))
@@ -2050,19 +2110,21 @@ def main() -> None:
     p.add_argument("dirs", nargs="*", metavar="DIR",
                    help="Extra directories to include (combined with config"
                         " watched_dirs; not saved to config)")
-    p.add_argument("--host")
+    p.add_argument("--host", metavar="IP")
     p.add_argument("--exclude",        nargs="+", metavar="PATTERN",
                    help="Add regex exclude patterns (to baseline meta, not config)")
     p.add_argument("--remove-exclude", nargs="+", metavar="PATTERN",
                    help="Remove exclude patterns from baseline meta")
     p.add_argument("-f", "--force", action="store_true",
                    help="Re-fetch existing dirs (overwrites them)")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="Skip overwrite confirmation")
     _add_baseline_arg(p)
 
     # ── diff ──────────────────────────────────────────────────────────────────
     p = sub.add_parser("diff",
                        help="Compare device state against baseline, generate patch")
-    p.add_argument("--host"); _add_patch_arg(p); _add_baseline_arg(p)
+    p.add_argument("--host", metavar="IP"); _add_patch_arg(p); _add_baseline_arg(p)
     p.add_argument("-n", "--skip-fetch", action="store_true",
                    help="Skip downloading — compare already-fetched files")
     p.add_argument("--dir", metavar="PATH",
@@ -2087,20 +2149,25 @@ def main() -> None:
     psub = p.add_subparsers(dest="patch_cmd", required=False)
 
     pa = psub.add_parser("add-file", help="Add/replace a file in the patch")
-    pa.add_argument("local_path")
-    pa.add_argument("remote_path")
-    pa.add_argument("--chown", metavar="USER:GROUP")
+    pa.add_argument("local_path",  help="Path to local file")
+    pa.add_argument("remote_path", help="Absolute path on the remote device")
+    pa.add_argument("--chown", metavar="USER:GROUP",
+                    help="Override owner (default: manifest default_chown)")
 
     pr = psub.add_parser("remove-file", help="Remove a file from the patch")
-    pr.add_argument("remote_path")
+    pr.add_argument("remote_path", help="Absolute remote path to remove from patch")
 
     pcp = psub.add_parser("copy", help="Copy a patch under a new name")
     pcp.add_argument("source", help="Source patch name")
     pcp.add_argument("dest",   help="New patch name")
+    pcp.add_argument("-f", "--force", action="store_true",
+                     help="Overwrite dest if it already exists")
 
     prn = psub.add_parser("rename", help="Rename a patch")
     prn.add_argument("old_name", help="Current patch name")
     prn.add_argument("new_name", help="New patch name")
+    prn.add_argument("-f", "--force", action="store_true",
+                     help="Overwrite new_name if it already exists")
 
     pd = psub.add_parser("delete", help="Delete a patch")
     pd.add_argument("name", help="Patch name to delete")
@@ -2132,12 +2199,12 @@ def main() -> None:
     # ── apply ─────────────────────────────────────────────────────────────────
     p = sub.add_parser("apply", help="Apply patch to one or more devices")
     p.add_argument("hosts", nargs="*", metavar="HOST"); _add_patch_arg(p)
-    p.add_argument("--ssh-user", metavar="USER")
-    p.add_argument("--ssh-port", metavar="PORT")
-    p.add_argument("--ssh-key",  metavar="PATH")
-    p.add_argument("--skip-pre",          action="store_true")
-    p.add_argument("--skip-files",        action="store_true")
-    p.add_argument("--skip-post",         action="store_true")
+    p.add_argument("--ssh-user", metavar="USER", help="Override SSH user")
+    p.add_argument("--ssh-port", metavar="PORT", help="Override SSH port")
+    p.add_argument("--ssh-key",  metavar="PATH", help="Override SSH key")
+    p.add_argument("--skip-pre",   action="store_true", help="Skip pre-commands stage")
+    p.add_argument("--skip-files", action="store_true", help="Skip file transfer stage")
+    p.add_argument("--skip-post",  action="store_true", help="Skip post-commands stage")
     p.add_argument("--skip-config-check", action="store_true",
                    help="Skip config/manifest command consistency check")
     p.add_argument("-d", "--dry-run",     action="store_true",
@@ -2148,15 +2215,18 @@ def main() -> None:
     # ── rollback ──────────────────────────────────────────────────────────────
     p = sub.add_parser("rollback", help="Revert device(s) to baseline state")
     p.add_argument("hosts", nargs="*", metavar="HOST")
-    p.add_argument("--host"); _add_baseline_arg(p)
+    p.add_argument("--host", metavar="IP", help="Source host to read current state from")
+    _add_baseline_arg(p)
     p.add_argument("-y", "--yes", action="store_true",
                    help="Skip confirmation when baseline has pending sync")
 
     # ── deploy ────────────────────────────────────────────────────────────────
     p = sub.add_parser("deploy",
                        help="Direct rsync from master to targets (no patch)")
-    p.add_argument("master", nargs="?", default=None)
-    p.add_argument("hosts",  nargs="*", metavar="HOST")
+    p.add_argument("master", nargs="?", default=None, metavar="MASTER",
+                   help="Source device (default: source_host or default_host)")
+    p.add_argument("hosts",  nargs="*", metavar="HOST",
+                   help="Target devices (required, no fallback)")
 
     # ── pack ──────────────────────────────────────────────────────────────────
     p = sub.add_parser("pack", help="Pack patch into a distributable archive")
@@ -2198,6 +2268,8 @@ def main() -> None:
     p.add_argument("--remove-post-command",  nargs="+", metavar="CMD")
     p.add_argument("--log-enable",   action="store_true", default=None)
     p.add_argument("--log-disable",  action="store_true", default=None)
+    p.add_argument("--set-default-patch-format",    metavar="FORMAT")
+    p.add_argument("--set-default-baseline-format", metavar="FORMAT")
     p.add_argument("--set-log-dir",      metavar="PATH")
     p.add_argument("--set-log-filename", metavar="PATTERN",
                    help="Log filename pattern: {cmd} {timestamp} {result}")
@@ -2227,9 +2299,22 @@ def main() -> None:
                                              DEFAULT_PATCH_NAME) or DEFAULT_PATCH_NAME
     else:
         patch_name = given_patch or cfg.get("default_patch", DEFAULT_PATCH_NAME) or ""
-        if not patch_name and args.cmd in {"diff", "apply", "pack", "patch",
-                                            "diff-commands", "status"}:
-            print("❌  No --patch and default_patch is disabled in config.")
+        # patch rename/copy/delete use positional args — --patch not needed
+        _patch_uses_positional = (
+            args.cmd == "patch" and
+            getattr(args, "patch_cmd", None) in {None, "rename", "copy", "delete"}
+        )
+        # diff --dry-run never creates a patch — no patch name needed
+        _diff_dry = (args.cmd == "diff" and getattr(args, "dry_run", False))
+        if not patch_name and not _patch_uses_positional and not _diff_dry \
+                and args.cmd in {"diff", "apply", "pack", "patch", "diff-commands", "status"}:
+            print("❌  No --patch specified and default_patch is disabled in config.")
+            _pr = tmp_paths["patches_root"]
+            available = sorted(p.name for p in _pr.iterdir()
+                               if p.is_dir() and (p / "manifest.json").exists()
+                               ) if _pr.exists() else []
+            if available:
+                print(f"    Available patches: {available}")
             print("    delta diff --patch NAME")
             sys.exit(1)
         patch_name = patch_name or DEFAULT_PATCH_NAME
@@ -2241,10 +2326,19 @@ def main() -> None:
     else:
         baseline_name = given_baseline or cfg.get("default_baseline",
                                                    DEFAULT_BASELINE) or ""
-        if not baseline_name and args.cmd in {"snapshot", "diff", "rollback",
-                                               "baseline"}:
-            print("❌  No --baseline and default_baseline is disabled in config.")
-            print("    delta snapshot --baseline NAME")
+        _baseline_uses_positional = (
+            args.cmd == "baseline" and
+            getattr(args, "baseline_cmd", None) in {None, "rename", "delete"}
+        )
+        if not baseline_name and not _baseline_uses_positional and args.cmd in {
+                "snapshot", "diff", "rollback", "baseline"}:
+            print("❌  No --baseline specified and default_baseline is disabled in config.")
+            _br = tmp_paths["baselines_root"]
+            available = sorted(b.name for b in _br.iterdir()
+                               if b.is_dir()) if _br.exists() else []
+            if available:
+                print(f"    Available baselines: {available}")
+            print("    Use: delta snapshot --baseline NAME  (or diff/rollback)")
             sys.exit(1)
         baseline_name = baseline_name or DEFAULT_BASELINE
 
@@ -2261,10 +2355,28 @@ def main() -> None:
         (args.cmd == "baseline" and _baseline_cmd in (None, "set-format")) or
         (args.cmd == "logs"     and _logs_cmd      in (None, "clear"))
     )
+    # Never log the log-clear operation — the log file would be deleted with the rest
+    if args.cmd == "logs" and _logs_cmd == "clear":
+        _read_only = True
     _should_log = args.cmd not in _NO_LOG and not _read_only
 
+    # Build subcmd label for log filename (e.g. "add-file", "rename", etc.)
+    _subcmd_parts = [s for s in [_patch_cmd, _baseline_cmd, _logs_cmd]
+                     if s and s not in ("set-format",)]
+    _subcmd = _subcmd_parts[0] if _subcmd_parts else None
+
+    # Silent logging: write the file but don't announce it
+    _SILENT_LOG = {
+        ("patch",         "rename"),  ("patch",    "copy"),
+        ("patch",         "delete"),
+        ("baseline",      "rename"),  ("baseline", "delete"),
+        ("diff-commands", None),
+        ("pack",          None),
+    }
+    _silent = (_should_log and (args.cmd, _subcmd) in _SILENT_LOG)
+
     if _should_log:
-        open_log(cfg, paths, args.cmd)
+        open_log(cfg, paths, args.cmd, subcmd=_subcmd, silent=_silent)
 
     dispatch = {
         "snapshot":      cmd_snapshot,
