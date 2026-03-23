@@ -120,7 +120,7 @@ DEFAULT_CONFIG: dict = {
     "default_baseline_format": "",   # display_format fallback for all baselines
     "log_enabled":  True,
     "log_dir":      "",   # empty = {work-dir}/logs
-    "log_filename": "{cmd}_{timestamp}_{result}.log",  # {cmd} {timestamp} {result}
+    "log_filename": "{timestamp}_{cmd}_{result}.log",  # {cmd} includes subcommand when present
 }
 
 
@@ -207,7 +207,7 @@ def open_log(cfg: dict, paths: dict, cmd: str,
         if subcmd:
             parts.append(subcmd)
         label = "_".join(parts)
-        name  = default_pattern.replace("{cmd}", label)                                .replace("{timestamp}", ts)                                .replace("{result}", "__RESULT__")
+        name  = default_pattern.replace("{timestamp}", ts)                               .replace("{cmd}", label)                               .replace("{result}", "__RESULT__")
     else:
         parts = [ts, cmd]
         if subcmd:
@@ -1033,6 +1033,15 @@ def cmd_diff(args, paths: dict, cfg: dict) -> None:
 
     warn_pending_sync(paths, skip_confirm=getattr(args, "yes", False))
 
+    # Per-diff excludes (CLI only, not saved anywhere)
+    diff_excludes = list(args.exclude or [])
+    if diff_excludes:
+        errs = validate_patterns(diff_excludes)
+        if errs:
+            for e in errs: print(e)
+            sys.exit(1)
+    all_excludes = excludes + [p for p in diff_excludes if p not in excludes]
+
     current = Path(args.dir) if args.dir \
         else Path(cfg["current_dir"]) if cfg.get("current_dir") \
         else (paths["tmp"] / "diff_preview") if _dry_no_patch \
@@ -1045,12 +1054,26 @@ def cmd_diff(args, paths: dict, cfg: dict) -> None:
         removed:  list = []
         modified: list = []
 
+        # Track files ignored by per-diff --exclude
+        ignored_files = []
+        if diff_excludes:
+            for d in watched:
+                curr_root_all = current / d.lstrip("/")
+                for rel in collect_files(curr_root_all, excludes, d):
+                    if is_excluded(rel, diff_excludes, d):
+                        ignored_files.append(d.rstrip("/") + "/" + rel)
+        if ignored_files:
+            print(f"\n  🚫  Ignored by --exclude ({len(ignored_files)} file(s)):")
+            for f in ignored_files:
+                print(f"    {f}")
+            print()
+
         for d in watched:
             bl_root   = paths["baseline"] / d.lstrip("/")
             curr_root = current / d.lstrip("/")
             prefix    = d.rstrip("/") + "/"
-            bl_files  = collect_files(bl_root,   excludes, d)
-            cr_files  = collect_files(curr_root, excludes, d)
+            bl_files  = collect_files(bl_root,   all_excludes, d)
+            cr_files  = collect_files(curr_root, all_excludes, d)
             for rel, h in cr_files.items():
                 entry = (prefix + rel, d, rel)
                 if rel not in bl_files:    added.append(entry)
@@ -1192,7 +1215,12 @@ def cmd_diff(args, paths: dict, cfg: dict) -> None:
     else:
         if not current.exists():
             has_cmds = bool(cfg.get("pre_commands") or cfg.get("post_commands"))
-            if has_cmds:
+            if _dry_no_patch and not args.dir:
+                print(f"❌  --skip-fetch with --dry-run requires --dir to point at"
+                      f" already-fetched files.")
+                print(f"    delta diff --dry-run --skip-fetch --dir PATH")
+                sys.exit(1)
+            elif has_cmds:
                 print(f"\n📋  --skip-fetch: no files downloaded yet — commands-only patch")
                 _do_diff(sock=None)
             else:
@@ -1214,17 +1242,32 @@ def cmd_diff_commands(args, paths: dict, cfg: dict) -> None:
         print(f"❌  No patch '{pname}'. Run: delta diff --patch {pname}")
         sys.exit(1)
     m = json.loads(mf.read_text())
-    m["pre_commands"]    = cfg.get("pre_commands",  [])
-    m["post_commands"]   = cfg.get("post_commands", [])
-    m["target_hosts"]    = cfg.get("target_hosts",  [])
-    m["remote_tmp_path"] = cfg.get("remote_tmp_path", "/tmp/_delta_patch.tar.gz")
-    m["default_chown"]   = cfg.get("default_chown", "")
+
+    fields = {
+        "pre_commands":    cfg.get("pre_commands",  []),
+        "post_commands":   cfg.get("post_commands", []),
+        "target_hosts":    cfg.get("target_hosts",  []),
+        "remote_tmp_path": cfg.get("remote_tmp_path", "/tmp/_delta_patch.tar.gz"),
+        # default_chown is derived from real stat data during diff — not a config setting
+    }
+
+    changes = {}
+    for key, new_val in fields.items():
+        old_val = m.get(key)
+        if old_val != new_val:
+            changes[key] = (old_val, new_val)
+        m[key] = new_val
+
+    if not changes:
+        print(f"✅  Patch '{pname}' is already in sync with config — nothing changed.")
+        return
+
     mf.write_text(json.dumps(m, indent=2, ensure_ascii=False))
     print(f"✅  Manifest updated for patch '{pname}':")
-    print(f"    pre_commands  : {m['pre_commands']}")
-    print(f"    post_commands : {m['post_commands']}")
-    print(f"    target_hosts  : {m['target_hosts']}")
-    print(f"    default_chown : {m['default_chown']}")
+    for key, (old_val, new_val) in changes.items():
+        print(f"    {key}:")
+        print(f"      was : {old_val}")
+        print(f"      now : {new_val}")
 
 
 # ── patch management ──────────────────────────────────────────────────────────
@@ -1891,6 +1934,237 @@ def cmd_deploy(args, paths: dict, cfg: dict) -> None:
     print_summary(results)
 
 
+# ── compare ───────────────────────────────────────────────────────────────────
+
+def cmd_compare(args, paths: dict, cfg: dict) -> None:
+    """
+    Compare current device state against both baseline and patch.
+
+    For each file in the patch:
+      applied   — device matches patch (change is deployed)
+      not_applied — device matches baseline (change not yet deployed)
+      diverged  — device differs from both (independent change on device)
+      removed_ok  — file deleted in patch and absent on device
+      removed_no  — file deleted in patch but still present on device
+
+    For files changed on device but NOT in patch:
+      extra     — device differs from baseline but patch doesn't touch it
+
+    Edge cases handled:
+      - add-file entries (file in patch but not in baseline)
+      - commands-only patch (no file changes)
+      - missing current/ (fetched on demand)
+    """
+    patch   = paths["patch"]
+    pname   = patch.name
+    mf      = patch / "manifest.json"
+    if not mf.exists():
+        print(f"❌  Patch '{pname}' not found.")
+        _pr = paths["patches_root"]
+        available = sorted(p.name for p in _pr.iterdir()
+                           if p.is_dir() and (p / "manifest.json").exists()
+                           ) if _pr.exists() else []
+        if available:
+            print(f"    Available patches: {available}")
+        sys.exit(1)
+
+    baseline = paths["baseline"]
+    bname    = baseline.name
+    if not baseline.exists():
+        print(f"❌  Baseline '{bname}' not found.")
+        _br = paths["baselines_root"]
+        available = sorted(b.name for b in _br.iterdir()
+                           if b.is_dir()) if _br.exists() else []
+        if available:
+            print(f"    Available baselines: {available}")
+        sys.exit(1)
+
+    m             = json.loads(mf.read_text())
+    added_entries = m.get("added",    [])
+    mod_entries   = m.get("modified", [])
+    rem_entries   = m.get("removed",  [])
+    watched       = m.get("watched_dirs", cfg["watched_dirs"])
+    excludes      = json.loads((paths["baseline_meta"]).read_text()).get(
+                       "exclude_patterns", cfg["exclude_patterns"]
+                   ) if paths["baseline_meta"].exists() else cfg["exclude_patterns"]
+
+    # Check if patch has any file changes
+    if not added_entries and not mod_entries and not rem_entries:
+        print(f"\nℹ️   Patch '{pname}' has no file changes (commands-only).")
+        print(f"    Nothing to compare.")
+        return
+
+    host = resolve_source(cfg, args.host)
+
+    # Determine where fetched device files go.
+    # Must be separate from patches/{name}/current/ which holds patch files.
+    current = Path(args.dir) if args.dir else paths["tmp"] / "compare_current"
+
+    if not args.skip_fetch:
+        print(f"\n🔍  Fetching from {host} → {current}")
+        if current.exists():
+            shutil.rmtree(current)
+        current.mkdir(parents=True)
+        try:
+            with ssh_master(cfg, host) as sock:
+                for d in watched:
+                    rsync_pull(cfg, host, d, current / d.lstrip("/"),
+                               excludes, sock)
+        except Exception as e:
+            if current == paths["tmp"] / "compare_current":
+                shutil.rmtree(current, ignore_errors=True)
+            print(f"❌  Fetch failed: {e}")
+            sys.exit(1)
+    else:
+        if not current.exists():
+            print(f"❌  --skip-fetch: {current} does not exist.")
+            print(f"    Run without --skip-fetch to download first.")
+            sys.exit(1)
+        print(f"\n🔍  Using already-fetched files from {current}")
+
+    # Build lookup: abs_path → hash for baseline and current
+    def _bl_hash(abs_path: str) -> str | None:
+        """Hash of file in local baseline mirror, None if absent."""
+        p = baseline / abs_path.lstrip("/")
+        return file_hash(p) if p.exists() else None
+
+    def _cur_hash(abs_path: str) -> str | None:
+        """Hash of file fetched from device, None if absent."""
+        p = current / abs_path.lstrip("/")
+        return file_hash(p) if p.exists() else None
+
+    def _patch_hash(abs_path: str) -> str | None:
+        """Hash of file in patch/current/ (files from last diff). None if absent."""
+        p = paths["current"] / abs_path.lstrip("/")
+        return file_hash(p) if p.exists() else None
+
+    # Warn early if patch/current/ is missing — hashes will all be None
+    if not paths["current"].exists():
+        print(f"\n⚠️   patches/{pname}/current/ not found.")
+        print(f"    Run delta diff --patch {pname} first to fetch patch files.")
+        print(f"    Proceeding — files will be marked as 'diverged'.\n")
+
+    # Categorise each file touched by the patch
+    applied     = []   # device == patch
+    not_applied = []   # device == baseline
+    diverged    = []   # device != baseline and device != patch
+    removed_ok  = []   # removed in patch and absent on device
+    removed_no  = []   # removed in patch but still on device
+
+    all_patch_paths = set()
+
+    for e in (added_entries + mod_entries):
+        fp        = entry_path(e)
+        all_patch_paths.add(fp)
+        bl_h      = _bl_hash(fp)
+        cur_h     = _cur_hash(fp)
+        patch_h   = _patch_hash(fp)
+
+        if patch_h is None:
+            # patches/{name}/current/ doesn't exist or file not in it
+            # Can't determine applied status without patch files
+            diverged.append(("diverged", fp,
+                              "patch files not available — run: delta diff --patch " + pname))
+        elif cur_h is None:
+            # File absent on device
+            if bl_h is None:
+                not_applied.append(("not_applied", fp, "new file — not yet created on device"))
+            else:
+                diverged.append(("diverged", fp, "file deleted on device (not in patch)"))
+        elif cur_h == patch_h:
+            applied.append(("applied", fp, None))
+        elif bl_h is not None and cur_h == bl_h:
+            not_applied.append(("not_applied", fp, None))
+        else:
+            if bl_h is None:
+                diverged.append(("diverged", fp,
+                                  "file exists but differs from patch (was new in patch)"))
+            else:
+                diverged.append(("diverged", fp,
+                                  "differs from both baseline and patch"))
+
+    for e in rem_entries:
+        fp = entry_path(e)
+        all_patch_paths.add(fp)
+        cur_h = _cur_hash(fp)
+        if cur_h is None:
+            removed_ok.append(("removed_ok", fp, None))
+        else:
+            removed_no.append(("removed_no", fp, "file still exists (not yet deleted)"))
+
+    # Find files changed on device but not in patch (extra changes)
+    extra = []
+    for d in watched:
+        bl_root   = baseline  / d.lstrip("/")
+        cur_root  = current / d.lstrip("/")
+        bl_files  = collect_files(bl_root,  excludes, d)
+        cur_files = collect_files(cur_root, excludes, d)
+        prefix    = d.rstrip("/") + "/"
+        for rel, h in cur_files.items():
+            fp = prefix + rel
+            if fp in all_patch_paths:
+                continue
+            bl_h = bl_files.get(rel)
+            if bl_h is None or bl_h != h:
+                extra.append(("extra", fp, "changed on device but not in patch"))
+        for rel in bl_files:
+            fp = prefix + rel
+            if fp in all_patch_paths:
+                continue
+            if rel not in cur_files:
+                extra.append(("extra", fp, "deleted on device but not in patch"))
+
+    # ── Print results ─────────────────────────────────────────────────────────
+    total   = len(applied) + len(not_applied) + len(diverged) \
+              + len(removed_ok) + len(removed_no)
+    show    = getattr(args, "show", False)
+
+    print(f"\n🔍  Checking if patch '{pname}' is applied on {host}  (baseline: '{bname}')\n")
+
+    def _section(items, icon, label, show_diff=False):
+        if not items:
+            return
+        print(f"  {icon}  {label} ({len(items)}):")
+        for _, fp, note in items:
+            suffix = f"  — {note}" if note else ""
+            print(f"    {fp}{suffix}")
+            if show_diff and show:
+                bl_f  = baseline      / fp.lstrip("/")
+                cur_f = current       / fp.lstrip("/")
+                pat_f = paths["current"] / fp.lstrip("/")
+                if bl_f.exists() or cur_f.exists():
+                    print(f"\n      ── baseline → device:")
+                    print_diff(bl_f  if bl_f.exists()  else None,
+                               cur_f if cur_f.exists() else None,
+                               f"baseline:{fp}", f"device:{fp}")
+                if pat_f.exists() and cur_f.exists():
+                    print(f"\n      ── patch → device:")
+                    print_diff(pat_f, cur_f,
+                               f"patch:{fp}", f"device:{fp}")
+                print()
+        print()
+
+    _section(applied,     "✅", "Applied — device matches patch")
+    _section(not_applied, "⏳", "Not applied — device matches baseline", show_diff=True)
+    _section(diverged,    "⚠️ ", "Diverged — differs from both",         show_diff=True)
+    _section(removed_ok,  "🗑️ ", "Removed — file absent on device (correct)")
+    _section(removed_no,  "❌", "Not removed — file still present on device")
+    _section(extra,       "🔀", "Extra changes on device (not in patch)")
+
+    # Summary line
+    n_ok  = len(applied) + len(removed_ok)
+    n_bad = len(not_applied) + len(diverged) + len(removed_no)
+    print(f"  {'═'*56}")
+    if n_bad == 0 and not extra:
+        print(f"  ✅  Patch fully applied ({n_ok}/{total} file(s) correct)")
+    elif n_bad == 0:
+        print(f"  ✅  Patch fully applied — {len(extra)} extra change(s) on device")
+    else:
+        print(f"  ⏳  {n_ok}/{total} file(s) applied, {n_bad} pending")
+        if extra:
+            print(f"      {len(extra)} extra change(s) on device")
+
+
 # ── pack ──────────────────────────────────────────────────────────────────────
 
 def cmd_pack(args, paths: dict, _cfg: dict) -> None:
@@ -1950,6 +2224,69 @@ def cmd_status(args, paths: dict, _cfg: dict) -> None:
             owner = entry_chown(e, m.get("default_chown", "")) if key != "removed" else ""
             suffix = f"  [{owner}]" if owner else ""
             print(f"    {path}{suffix}")
+
+    if not getattr(args, "show", False):
+        return
+
+    # --show: diff between baseline and patch/current/
+    # Use baseline_name from manifest — that's the one used during diff
+    bname     = m.get("baseline_name", paths["baseline"].name)
+    baseline  = paths["baselines_root"] / bname
+    current   = paths["current"]
+
+    if not baseline.exists():
+        print(f"\n⚠️   Cannot show diff: baseline '{bname}' not found.")
+        return
+
+    # Prefer current/, fall back to extracting changes.tar.gz
+    patch_src = None
+    extracted = False
+    if current.exists():
+        patch_src = current
+    else:
+        tar_path = paths["patch"] / "changes.tar.gz"
+        if tar_path.exists():
+            patch_src = paths["tmp"] / "status_extract"
+            if patch_src.exists():
+                shutil.rmtree(patch_src)
+            patch_src.mkdir(parents=True)
+            with tarfile.open(tar_path, "r:gz") as tar:
+                tar.extractall(patch_src)
+            extracted = True
+            print(f"  ℹ️   current/ not found — extracted from changes.tar.gz")
+        else:
+            print(f"\n⚠️   Cannot show diff: neither current/ nor changes.tar.gz found.")
+            print(f"    Run: delta diff --patch {pname}")
+            return
+
+    try:
+        all_entries = m.get("added", []) + m.get("modified", [])
+        removed     = m.get("removed", [])
+        if not all_entries and not removed:
+            print(f"\n  ℹ️   No file changes in patch (commands only).")
+            return
+        sep = "═" * 60
+        print(f"\n{sep}")
+        print(f"  Diff: baseline '{bname}' → patch '{pname}'")
+        print(f"{sep}")
+        for e in all_entries:
+            fp   = entry_path(e)
+            bl_f = baseline  / fp.lstrip("/")
+            p_f  = patch_src / fp.lstrip("/")
+            print(f"\n  ── {fp}")
+            print_diff(bl_f if bl_f.exists() else None,
+                       p_f  if p_f.exists()  else None,
+                       f"baseline:{fp}", f"patch:{fp}")
+        for e in removed:
+            fp   = entry_path(e)
+            bl_f = baseline / fp.lstrip("/")
+            print(f"\n  ── {fp}  [removed]")
+            if bl_f.exists() and is_text(bl_f):
+                print_diff(bl_f, None,
+                           f"baseline:{fp}", "patch:(deleted)")
+    finally:
+        if extracted and patch_src:
+            shutil.rmtree(patch_src, ignore_errors=True)
 
 
 # ── logs ──────────────────────────────────────────────────────────────────────
@@ -2106,7 +2443,13 @@ def main() -> None:
 
     # ── snapshot ──────────────────────────────────────────────────────────────
     p = sub.add_parser("snapshot",
-                       help="Fetch dirs from device and save as baseline")
+                       help="Fetch dirs from device and save as baseline",
+                       description=(
+                           "Capture the current state of the source device as a named baseline.\n"
+                           "Reads watched_dirs from config; writes only to baseline/meta.json.\n"
+                           "SSH is opened only when there is something to fetch.\n"
+                           "Use --exclude to add baseline-local patterns (not saved to config)."
+                       ))
     p.add_argument("dirs", nargs="*", metavar="DIR",
                    help="Extra directories to include (combined with config"
                         " watched_dirs; not saved to config)")
@@ -2123,7 +2466,13 @@ def main() -> None:
 
     # ── diff ──────────────────────────────────────────────────────────────────
     p = sub.add_parser("diff",
-                       help="Compare device state against baseline, generate patch")
+                       help="Compare device state against baseline, generate patch",
+                       description=(
+                           "Fetch the current device state, compare it against a baseline,\n"
+                           "and build a patch (changes.tar.gz + manifest.json).\n"
+                           "Reads watched_dirs and excludes from baseline meta — not from config.\n"
+                           "Use --dry-run to preview changes without creating a patch."
+                       ))
     p.add_argument("--host", metavar="IP"); _add_patch_arg(p); _add_baseline_arg(p)
     p.add_argument("-n", "--skip-fetch", action="store_true",
                    help="Skip downloading — compare already-fetched files")
@@ -2135,15 +2484,27 @@ def main() -> None:
                    help="Show changes but do not create a patch")
     p.add_argument("-y", "--yes", action="store_true",
                    help="Skip confirmation when baseline has pending sync")
+    p.add_argument("--exclude", nargs="+", metavar="PATTERN",
+                   help="Ignore matching files for this diff only (regex, not saved)")
 
     # ── diff-commands ─────────────────────────────────────────────────────────
     p = sub.add_parser("diff-commands",
-                       help="Sync commands/targets from config into manifest"
-                            " (no re-fetch)")
+                       help="Sync commands/targets from config into manifest (no re-fetch)",
+                       description=(
+                           "Update pre_commands, post_commands, target_hosts, remote_tmp_path\n"
+                           "and default_chown in an existing manifest from current config.\n"
+                           "Does not re-fetch files or re-compare. Use after changing commands\n"
+                           "in config without wanting to re-run a full diff."
+                       ))
     _add_patch_arg(p)
 
     # ── patch ─────────────────────────────────────────────────────────────────
-    p    = sub.add_parser("patch", help="List patches or manage patch contents")
+    p    = sub.add_parser("patch",
+                          help="List patches or manage patch contents",
+                          description=(
+                              "Without a subcommand: list all available patches.\n"
+                              "Subcommands: add-file, remove-file, copy, rename, delete, set-format."
+                          ))
     _add_patch_arg(p)
     p.add_argument("-v", "--verbose", action="store_true")
     psub = p.add_subparsers(dest="patch_cmd", required=False)
@@ -2179,7 +2540,11 @@ def main() -> None:
 
     # ── baseline ──────────────────────────────────────────────────────────────
     p    = sub.add_parser("baseline",
-                          help="List baselines or manage baseline metadata")
+                          help="List baselines or manage baseline metadata",
+                          description=(
+                              "Without a subcommand: list all available baselines.\n"
+                              "Subcommands: rename, delete, set-format."
+                          ))
     _add_baseline_arg(p)
     p.add_argument("-v", "--verbose", action="store_true")
     bsub = p.add_subparsers(dest="baseline_cmd", required=False)
@@ -2197,7 +2562,15 @@ def main() -> None:
     bsf.add_argument("format", metavar="FORMAT")
 
     # ── apply ─────────────────────────────────────────────────────────────────
-    p = sub.add_parser("apply", help="Apply patch to one or more devices")
+    p = sub.add_parser("apply",
+                       help="Apply patch to one or more devices",
+                       description=(
+                           "Deploy a patch to target devices in three stages:\n"
+                           "  1. Pre-commands (SSH commands before file changes)\n"
+                           "  2. File transfer (SCP + extract + chown + delete removed)\n"
+                           "  3. Post-commands (SSH commands after file changes)\n"
+                           "Use --dry-run to preview without opening any SSH connection."
+                       ))
     p.add_argument("hosts", nargs="*", metavar="HOST"); _add_patch_arg(p)
     p.add_argument("--ssh-user", metavar="USER", help="Override SSH user")
     p.add_argument("--ssh-port", metavar="PORT", help="Override SSH port")
@@ -2213,7 +2586,13 @@ def main() -> None:
                    help="Variable substitution in commands (repeatable)")
 
     # ── rollback ──────────────────────────────────────────────────────────────
-    p = sub.add_parser("rollback", help="Revert device(s) to baseline state")
+    p = sub.add_parser("rollback",
+                       help="Revert device(s) to baseline state",
+                       description=(
+                           "Fetch current device state, compare with baseline,\n"
+                           "and restore any files that differ back to baseline state.\n"
+                           "Reads ownership from baseline/meta.json."
+                       ))
     p.add_argument("hosts", nargs="*", metavar="HOST")
     p.add_argument("--host", metavar="IP", help="Source host to read current state from")
     _add_baseline_arg(p)
@@ -2222,60 +2601,135 @@ def main() -> None:
 
     # ── deploy ────────────────────────────────────────────────────────────────
     p = sub.add_parser("deploy",
-                       help="Direct rsync from master to targets (no patch)")
+                       help="Direct rsync from master to targets (no patch)",
+                       description=(
+                           "Directly rsync watched_dirs from a master device to targets.\n"
+                           "No patch is created, no rollback is possible.\n"
+                           "Target hosts must be specified explicitly — no fallback."
+                       ))
     p.add_argument("master", nargs="?", default=None, metavar="MASTER",
                    help="Source device (default: source_host or default_host)")
     p.add_argument("hosts",  nargs="*", metavar="HOST",
                    help="Target devices (required, no fallback)")
 
+    # ── compare ──────────────────────────────────────────────────────────────
+    p = sub.add_parser("compare",
+                       help="Compare device state against baseline and patch",
+                       description=(
+                           "Fetch current device state and check whether a patch has been applied.\n"
+                           "Categorises each file as: applied, not_applied, diverged,\n"
+                           "removed_ok, removed_no, or extra (changed outside the patch).\n"
+                           "Use --show for a line-by-line diff of each changed file."
+                       ))
+    p.add_argument("--host", metavar="IP")
+    _add_patch_arg(p); _add_baseline_arg(p)
+    p.add_argument("-n", "--skip-fetch", action="store_true",
+                   help="Use already-fetched files instead of downloading")
+    p.add_argument("--dir", metavar="PATH",
+                   help="Use this directory for fetched files")
+    p.add_argument("-s", "--show", action="store_true",
+                   help="Show line-by-line diff for changed files")
+
     # ── pack ──────────────────────────────────────────────────────────────────
-    p = sub.add_parser("pack", help="Pack patch into a distributable archive")
+    p = sub.add_parser("pack",
+                       help="Pack patch into a distributable archive",
+                       description=(
+                           "Bundle changes.tar.gz, manifest.json, and delta.py\n"
+                           "into a single archive for transfer to another PC.\n"
+                           "The manifest is self-contained — no config needed to apply."
+                       ))
     _add_patch_arg(p)
     p.add_argument("-o", "--output", metavar="FILE")
 
     # ── status ────────────────────────────────────────────────────────────────
-    p = sub.add_parser("status", help="Show patch summary")
+    p = sub.add_parser("status",
+                       help="Show patch summary",
+                       description=(
+                           "Show a detailed summary of the current patch: file counts,\n"
+                           "commands, targets, and per-file ownership.\n"
+                           "Use --show to display a line-by-line diff between baseline and patch."
+                       ))
     _add_patch_arg(p)
+    p.add_argument("-s", "--show", action="store_true",
+                   help="Show line-by-line diff between baseline and patch")
 
     # ── logs ──────────────────────────────────────────────────────────────────
-    p    = sub.add_parser("logs", help="List or manage log files")
+    p    = sub.add_parser("logs",
+                          help="List or manage log files",
+                          description=(
+                              "Without a subcommand: list all log files with timestamp and size.\n"
+                              "Subcommand: clear — delete all log files."
+                          ))
     lsub = p.add_subparsers(dest="logs_cmd", required=False)
     lc   = lsub.add_parser("clear", help="Delete all log files")
     lc.add_argument("-y", "--yes", action="store_true")
 
     # ── config ────────────────────────────────────────────────────────────────
-    p = sub.add_parser("config", help="View or edit config")
+    p = sub.add_parser("config",
+                       help="View or edit config",
+                       description=(
+                           "The only command that modifies config.json.\n"
+                           "Without arguments: print current config as JSON.\n"
+                           "All other commands only read from config — never write to it."
+                       ))
     p.add_argument("--set-host",             metavar="IP",
                    help="Set default_host (fallback for source and targets)")
-    p.add_argument("--set-source-host",      metavar="IP")
-    p.add_argument("--set-ssh-user",         metavar="USER")
-    p.add_argument("--set-ssh-port",         metavar="PORT")
-    p.add_argument("--set-ssh-key",          metavar="PATH")
-    p.add_argument("--set-default-patch",    metavar="NAME")
-    p.add_argument("--set-default-baseline", metavar="NAME")
-    p.add_argument("--set-default-chown",    metavar="USER:GROUP")
-    p.add_argument("--set-current-dir",      metavar="PATH")
-    p.add_argument("--set-remote-tmp-path",  metavar="PATH")
-    p.add_argument("--add-watched-dir",      nargs="+", metavar="DIR")
-    p.add_argument("--remove-watched-dir",   nargs="+", metavar="DIR")
-    p.add_argument("--add-target-host",      nargs="+", metavar="HOST")
-    p.add_argument("--remove-target-host",   nargs="+", metavar="HOST")
-    p.add_argument("--add-exclude",          nargs="+", metavar="PATTERN")
-    p.add_argument("--remove-exclude",       nargs="+", metavar="PATTERN")
-    p.add_argument("--add-pre-command",      nargs="+", metavar="CMD")
-    p.add_argument("--remove-pre-command",   nargs="+", metavar="CMD")
-    p.add_argument("--add-post-command",     nargs="+", metavar="CMD")
-    p.add_argument("--remove-post-command",  nargs="+", metavar="CMD")
-    p.add_argument("--log-enable",   action="store_true", default=None)
-    p.add_argument("--log-disable",  action="store_true", default=None)
-    p.add_argument("--set-default-patch-format",    metavar="FORMAT")
-    p.add_argument("--set-default-baseline-format", metavar="FORMAT")
-    p.add_argument("--set-log-dir",      metavar="PATH")
+    p.add_argument("--set-source-host",      metavar="IP",
+                   help="Source device for snapshot/diff/rollback (overrides default_host)")
+    p.add_argument("--set-ssh-user",         metavar="USER",
+                   help="SSH username (default: root)")
+    p.add_argument("--set-ssh-port",         metavar="PORT",
+                   help="SSH port (default: 22)")
+    p.add_argument("--set-ssh-key",          metavar="PATH",
+                   help="Path to SSH private key (default: SSH agent)")
+    p.add_argument("--set-default-patch",    metavar="NAME",
+                   help="Default patch name (empty = must specify --patch explicitly)")
+    p.add_argument("--set-default-baseline", metavar="NAME",
+                   help="Default baseline name (empty = must specify --baseline explicitly)")
+    p.add_argument("--set-default-chown",    metavar="USER:GROUP",
+                   help="Fallback file owner when stat fails during diff")
+    p.add_argument("--set-current-dir",      metavar="PATH",
+                   help="Directory for fetched files during diff (default: patches/{name}/current/)")
+    p.add_argument("--set-remote-tmp-path",  metavar="PATH",
+                   help="Temp path on device for patch archive upload (default: /tmp/_delta_patch.tar.gz)")
+    p.add_argument("--add-watched-dir",      nargs="+", metavar="DIR",
+                   help="Add directory to watch (used as template for new snapshots)")
+    p.add_argument("--remove-watched-dir",   nargs="+", metavar="DIR",
+                   help="Remove directory from watched list")
+    p.add_argument("--add-target-host",      nargs="+", metavar="HOST",
+                   help="Add target device for apply/rollback")
+    p.add_argument("--remove-target-host",   nargs="+", metavar="HOST",
+                   help="Remove target device")
+    p.add_argument("--add-exclude",          nargs="+", metavar="PATTERN",
+                   help="Add global regex exclude pattern (applies to all future snapshots)")
+    p.add_argument("--remove-exclude",       nargs="+", metavar="PATTERN",
+                   help="Remove global exclude pattern")
+    p.add_argument("--add-pre-command",      nargs="+", metavar="CMD",
+                   help="Add command to run on device before file transfer (supports {VAR} substitution)")
+    p.add_argument("--remove-pre-command",   nargs="+", metavar="CMD",
+                   help="Remove pre-command")
+    p.add_argument("--add-post-command",     nargs="+", metavar="CMD",
+                   help="Add command to run on device after file transfer (supports {VAR} substitution)")
+    p.add_argument("--remove-post-command",  nargs="+", metavar="CMD",
+                   help="Remove post-command")
+    p.add_argument("--log-enable",   action="store_true", default=None,
+                   help="Enable logging to file")
+    p.add_argument("--log-disable",  action="store_true", default=None,
+                   help="Disable logging to file")
+    p.add_argument("--set-default-patch-format",    metavar="FORMAT",
+                   help="Default display format for patch list (Python format string with manifest keys)")
+    p.add_argument("--set-default-baseline-format", metavar="FORMAT",
+                   help="Default display format for baseline list (Python format string with meta keys)")
+    p.add_argument("--set-log-dir",      metavar="PATH",
+                   help="Directory for log files (default: {work-dir}/logs/)")
     p.add_argument("--set-log-filename", metavar="PATTERN",
-                   help="Log filename pattern: {cmd} {timestamp} {result}")
-    p.add_argument("--add-snapshot-command",     nargs="+", metavar="CMD")
-    p.add_argument("--add-snapshot-command-key", nargs="+", metavar="KEY=CMD")
-    p.add_argument("--clear-snapshot-commands",  action="store_true")
+                   help="Log filename pattern. {cmd} includes subcommand when present (e.g. patch_rename). Available: {timestamp} {cmd} {result}")
+    p.add_argument("--add-snapshot-command",     nargs="+", metavar="CMD",
+                   help="Add command to run on device during snapshot (output printed only)")
+    p.add_argument("--add-snapshot-command-key", nargs="+", metavar="KEY=CMD",
+                   help="Add command and store its output in meta.json under KEY")
+    p.add_argument("--clear-snapshot-commands",  action="store_true",
+                   help="Remove all snapshot commands")
 
     # ── Parse and resolve names ───────────────────────────────────────────────
     args = parser.parse_args()
@@ -2288,8 +2742,7 @@ def main() -> None:
     given_baseline = getattr(args, "baseline", None)
 
     # Commands that don't need a specific patch/baseline
-    NO_PATCH_NEEDED    = {"snapshot", "deploy", "config", "status",
-                          "logs", "diff-commands"}
+    NO_PATCH_NEEDED    = {"snapshot", "deploy", "config", "status", "logs"}
     NO_BASELINE_NEEDED = {"deploy", "config", "pack", "diff-commands",
                           "status", "logs"}
 
@@ -2307,7 +2760,8 @@ def main() -> None:
         # diff --dry-run never creates a patch — no patch name needed
         _diff_dry = (args.cmd == "diff" and getattr(args, "dry_run", False))
         if not patch_name and not _patch_uses_positional and not _diff_dry \
-                and args.cmd in {"diff", "apply", "pack", "patch", "diff-commands", "status"}:
+                and args.cmd in {"diff", "apply", "pack", "patch",
+                                 "diff-commands", "status", "compare"}:
             print("❌  No --patch specified and default_patch is disabled in config.")
             _pr = tmp_paths["patches_root"]
             available = sorted(p.name for p in _pr.iterdir()
@@ -2315,7 +2769,16 @@ def main() -> None:
                                ) if _pr.exists() else []
             if available:
                 print(f"    Available patches: {available}")
-            print("    delta diff --patch NAME")
+            hints = {
+                "diff":          "delta diff --patch NAME",
+                "apply":         "delta apply --patch NAME",
+                "pack":          "delta pack --patch NAME",
+                "patch":         "delta patch --patch NAME",
+                "diff-commands": "delta diff-commands --patch NAME",
+                "status":        "delta status --patch NAME",
+                "compare":       "delta compare --patch NAME",
+            }
+            print(f"    {hints.get(args.cmd, f'delta {args.cmd} --patch NAME')}")
             sys.exit(1)
         patch_name = patch_name or DEFAULT_PATCH_NAME
 
@@ -2331,14 +2794,15 @@ def main() -> None:
             getattr(args, "baseline_cmd", None) in {None, "rename", "delete"}
         )
         if not baseline_name and not _baseline_uses_positional and args.cmd in {
-                "snapshot", "diff", "rollback", "baseline"}:
+                "snapshot", "diff", "rollback", "baseline", "compare"}:
             print("❌  No --baseline specified and default_baseline is disabled in config.")
             _br = tmp_paths["baselines_root"]
             available = sorted(b.name for b in _br.iterdir()
                                if b.is_dir()) if _br.exists() else []
             if available:
                 print(f"    Available baselines: {available}")
-            print("    Use: delta snapshot --baseline NAME  (or diff/rollback)")
+            cmd_hint = args.cmd
+            print(f"    delta {cmd_hint} --baseline NAME")
             sys.exit(1)
         baseline_name = baseline_name or DEFAULT_BASELINE
 
@@ -2349,7 +2813,7 @@ def main() -> None:
     _patch_cmd    = getattr(args, "patch_cmd",    None)
     _baseline_cmd = getattr(args, "baseline_cmd", None)
     _logs_cmd     = getattr(args, "logs_cmd",     None)
-    _NO_LOG = {"config", "status", "logs"}
+    _NO_LOG = {"config", "status", "logs", "compare"}
     _read_only = (
         (args.cmd == "patch"    and _patch_cmd    in (None, "set-format")) or
         (args.cmd == "baseline" and _baseline_cmd in (None, "set-format")) or
@@ -2387,6 +2851,7 @@ def main() -> None:
         "apply":         cmd_apply,
         "rollback":      cmd_rollback,
         "deploy":        cmd_deploy,
+        "compare":       cmd_compare,
         "pack":          cmd_pack,
         "status":        cmd_status,
         "logs":          cmd_logs,
