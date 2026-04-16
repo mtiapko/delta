@@ -415,14 +415,9 @@ def _resolve_entity_file(
 
 
 def _path_matches(file_path: str, filter_paths: list[str]) -> bool:
-    for p in filter_paths:
-        if file_path == p:
-            return True
-        if p.endswith("/") and file_path.startswith(p):
-            return True
-        if not p.endswith("/") and file_path.startswith(p + "/"):
-            return True
-    return False
+    """Match paths: exact, directory prefix, or glob pattern."""
+    from delta.staging_ops import _matches_paths
+    return _matches_paths(file_path, filter_paths)
 
 
 def _print_totals(diff_result: DiffResult) -> None:

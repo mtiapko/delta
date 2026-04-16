@@ -353,10 +353,12 @@ def fetch(ctx: DeltaContext, scan_only: bool, detailed: bool, compress: bool | N
 @click.option("--against", "against_name", default="", help="Compare against specific entity.")
 @click.option("--full", is_flag=True, help="Also show content of new/deleted files.")
 @click.option("--fetch", "do_fetch", is_flag=True, help="Fetch from device first.")
+@click.option("--staged", "--cached", "staged", is_flag=True,
+              help="Show diffs for staged files (like 'git diff --cached').")
 @click.option("--ignore", "-i", "extra_ignore", multiple=True, help="Extra ignore patterns.")
 @pass_ctx
 def diff(ctx: DeltaContext, paths: tuple[str, ...], against_name: str,
-         full: bool, do_fetch: bool, extra_ignore: tuple[str, ...]) -> None:
+         full: bool, do_fetch: bool, staged: bool, extra_ignore: tuple[str, ...]) -> None:
     """Show detailed changes between device and reference.
 
     \b
@@ -365,7 +367,8 @@ def diff(ctx: DeltaContext, paths: tuple[str, ...], against_name: str,
 
     \b
     Examples:
-      delta diff                       # All changes, detailed
+      delta diff                       # Device vs reference
+      delta diff --staged              # Staging vs reference (like git diff --cached)
       delta diff /etc/wpa.conf         # Only this file
       delta diff /etc/                 # All changes under /etc/
       delta diff --full                # Include new/deleted content
@@ -385,6 +388,17 @@ def diff(ctx: DeltaContext, paths: tuple[str, ...], against_name: str,
             ui.print_error("No active reference. Use 'delta use <n>' or '--against <n>'.")
             sys.exit(1)
         ref_type = ctx.storage.get_entity_type(ref_name)
+
+        if staged:
+            # Diff staging vs reference
+            manifest = ctx.storage.load_staging()
+            if manifest.is_empty:
+                ui.print_success("Nothing staged.")
+                return
+            _print_staged_diff(ctx.storage, manifest, ref_name, ref_type,
+                               filter_paths=list(paths) if paths else None,
+                               show_new_deleted=full)
+            return
 
         if do_fetch:
             ctx.invoke(fetch)
@@ -411,6 +425,60 @@ def diff(ctx: DeltaContext, paths: tuple[str, ...], against_name: str,
         sys.exit(1)
 
 
+def _print_staged_diff(storage, manifest, ref_name, ref_type, *,
+                       filter_paths=None, show_new_deleted=False):
+    """Show diffs for staged files vs reference."""
+    from delta.diff_ops import _resolve_entity_file, _print_unified_diff, _path_matches
+    import click as _click
+
+    modified = sorted(manifest.modified)
+    created = sorted(manifest.created)
+    deleted = sorted(manifest.deleted)
+
+    if filter_paths:
+        modified = [p for p in modified if _path_matches(p, filter_paths)]
+        created = [p for p in created if _path_matches(p, filter_paths)]
+        deleted = [p for p in deleted if _path_matches(p, filter_paths)]
+
+    if not modified and not created and not deleted:
+        ui.print_info("No matching staged changes.")
+        return
+
+    # Modified — line-by-line diff
+    for rpath in modified:
+        old = _resolve_entity_file(storage, ref_name, ref_type, rpath)
+        new = storage.get_staging_file(rpath)
+        _print_unified_diff(rpath, old, new if new.exists() else None,
+                            f"{ref_type.value}/{ref_name}", "staged")
+
+    # Created
+    if created:
+        _click.echo(_click.style(f"\n{'─' * 60}", fg="cyan"))
+        if show_new_deleted:
+            for rpath in created:
+                new = storage.get_staging_file(rpath)
+                from delta.diff_ops import _print_new_file
+                _print_new_file(rpath, new if new.exists() else None)
+        else:
+            _click.echo(_click.style("  Added files:", fg="green", bold=True))
+            for rpath in created:
+                ui.print_file_change("A", rpath)
+
+    # Deleted
+    if deleted:
+        _click.echo(_click.style(f"\n{'─' * 60}", fg="cyan"))
+        if show_new_deleted:
+            for rpath in deleted:
+                old = _resolve_entity_file(storage, ref_name, ref_type, rpath)
+                from delta.diff_ops import _print_deleted_file
+                _print_deleted_file(rpath, old)
+        else:
+            _click.echo(_click.style("  Deleted files:", fg="red", bold=True))
+            for rpath in deleted:
+                ui.print_file_change("D", rpath)
+        sys.exit(1)
+
+
 # ======================================================================
 # delta status (LOCAL)
 # ======================================================================
@@ -421,8 +489,8 @@ def status(ctx: DeltaContext) -> None:
     """Show current state: reference, changes, staging.
 
     \b
-    Overview of everything: active reference, last fetch,
-    file changes summary, and staging status.
+    Shows changes grouped like 'git status': staged files shown individually,
+    unstaged changes with many files in a directory are shown as the directory.
     """
     ctx.require_init()
     state = ctx.get_state()
@@ -439,44 +507,67 @@ def status(ctx: DeltaContext) -> None:
 
     ui.print_info(f"Baselines: {len(ctx.storage.list_baselines())}  Patches: {len(ctx.storage.list_patches())}")
 
-    # Show changes from cached scan (excluding staged)
     scan = ctx.storage.load_scan()
     manifest = ctx.storage.load_staging()
+
+    # Staged changes — show individually (like git)
+    if not manifest.is_empty:
+        ui.print_info(f"\nChanges to be committed (staging vs {manifest.reference}):")
+        for p in sorted(manifest.modified):
+            ui.print_file_change("M", p)
+        for p in sorted(manifest.created):
+            ui.print_file_change("A", p)
+        for p in sorted(manifest.deleted):
+            ui.print_file_change("D", p)
+
+    # Unstaged changes — compress directories
     if scan and state.active:
-        ui.print_info(f"Last fetch: {ui.format_time_ago(scan.timestamp)} from {scan.host} (vs {scan.reference})")
+        ui.print_info(f"\nLast fetch: {ui.format_time_ago(scan.timestamp)} from {scan.host} (vs {scan.reference})")
 
         from delta.diff_ops import compare_with_reference
-        from delta.models import DiffResult
         ref_type = ctx.storage.get_entity_type(state.active)
         diff_result = compare_with_reference(ctx.storage, scan, state.active, ref_type)
 
-        # Filter out staged files
-        unstaged_mod = [f for f in diff_result.modified if f.path not in manifest.modified]
-        unstaged_new = [f for f in diff_result.created if f.path not in manifest.created]
+        # Filter out staged
+        unstaged_mod = [f.path for f in diff_result.modified if f.path not in manifest.modified]
+        unstaged_new = [f.path for f in diff_result.created if f.path not in manifest.created]
         unstaged_del = [p for p in diff_result.deleted if p not in manifest.deleted]
 
         if unstaged_mod or unstaged_new or unstaged_del:
-            ui.print_info("\nUnstaged changes:")
-            for f in sorted(unstaged_mod, key=lambda x: x.path):
-                ui.print_file_change("M", f.path)
-            for f in sorted(unstaged_new, key=lambda x: x.path):
-                ui.print_file_change("A", f.path)
-            for p in sorted(unstaged_del):
-                ui.print_file_change("D", p)
-        elif not diff_result.has_changes:
+            ui.print_info("\nChanges not staged for commit:")
+            _print_compressed(unstaged_mod, "M")
+            _print_compressed(unstaged_new, "A")
+            _print_compressed(unstaged_del, "D")
+        elif manifest.is_empty:
             ui.print_success("No changes vs reference.")
     elif not scan:
-        ui.print_info("Last fetch: (none)")
+        ui.print_info("\nLast fetch: (none)")
 
-    # Staging
-    if not manifest.is_empty:
-        ui.print_info(f"\nStaging: {manifest.total_files} files (vs {manifest.reference})")
-        for f in sorted(manifest.modified):
-            ui.print_file_change("M", f)
-        for f in sorted(manifest.created):
-            ui.print_file_change("A", f)
-        for f in sorted(manifest.deleted):
-            ui.print_file_change("D", f)
+
+def _print_compressed(paths: list[str], change_type: str, threshold: int = 3) -> None:
+    """Print paths, collapsing directories with many files of same type."""
+    if not paths:
+        return
+
+    # Group by parent directory
+    from collections import defaultdict
+    by_dir: dict[str, list[str]] = defaultdict(list)
+    for p in paths:
+        parent = os.path.dirname(p) or "/"
+        by_dir[parent].append(p)
+
+    # For each directory, either show files or collapse
+    shown: set[str] = set()
+    for parent in sorted(by_dir.keys()):
+        files = by_dir[parent]
+        if len(files) >= threshold:
+            ui.print_file_change(change_type, f"{parent}/  ({len(files)} files)")
+            shown.update(files)
+
+    # Show remaining files individually
+    for p in sorted(paths):
+        if p not in shown:
+            ui.print_file_change(change_type, p)
 
 
 # ======================================================================
@@ -920,7 +1011,13 @@ def patch_add(ctx: DeltaContext, paths: tuple[str, ...], local_file: str,
     """Stage files for next commit.
 
     \b
-    Use '.' to stage all changes from device.
+    Paths can be:
+      - Exact:    /etc/config.conf
+      - Directory: /etc/ or /etc (matches all files under)
+      - Glob:     /etc/*.conf  /etc/**/*.json  (use quotes in shell)
+      - Special:  . (all changes from device)
+
+    \b
     Use --file to add a local file (bypasses fetch/diff).
     Use --delete to mark a file for deletion.
     Use --force to add from baseline even if unchanged.
@@ -929,8 +1026,10 @@ def patch_add(ctx: DeltaContext, paths: tuple[str, ...], local_file: str,
     Examples:
       delta patch add .                                  # Stage all device changes
       delta patch add /etc/config.conf                   # Stage one file
+      delta patch add "/etc/*.conf"                      # Glob pattern
+      delta patch add "/var/**/*.log"                    # Recursive glob
       delta patch add /etc/app.conf --file ./my.conf     # Local file → device path
-      delta patch add /etc/old.conf --delete             # Delete on device
+      delta patch add "/etc/*.old" --delete              # Delete matching on device
       delta patch add /etc/config.conf --force           # Add from baseline
     """
     ctx.require_init()
@@ -1035,7 +1134,18 @@ def patch_edit(ctx: DeltaContext, remote_path: str) -> None:
 @click.argument("paths", nargs=-1, required=True)
 @pass_ctx
 def patch_remove(ctx: DeltaContext, paths: tuple[str, ...]) -> None:
-    """Remove files from staging."""
+    """Remove files from staging.
+
+    \b
+    Supports same patterns as 'patch add':
+      - Exact path, directory, or glob.
+
+    \b
+    Examples:
+      delta patch remove /etc/config.conf
+      delta patch remove /etc/
+      delta patch remove "/etc/*.conf"
+    """
     ctx.require_init()
     from delta.staging_ops import stage_remove
     stage_remove(ctx.storage, list(paths))

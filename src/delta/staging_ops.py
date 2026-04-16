@@ -195,13 +195,19 @@ def stage_add(
 def stage_remove(storage: Storage, paths: list[str]) -> StagingManifest:
     from delta import ui
     manifest = storage.load_staging()
+
+    # Collect all staged paths, find those matching any pattern
+    all_staged = list(manifest.modified) + list(manifest.created) + list(manifest.deleted)
+    to_remove = [p for p in all_staged if _matches_paths(p, paths)]
+
     removed = 0
-    for path in paths:
+    for path in to_remove:
         if manifest.remove_file(path):
             removed += 1
             staged = storage.get_staging_file(path)
             if staged.exists():
                 staged.unlink()
+
     storage.save_staging(manifest)
     if removed:
         ui.print_success(f"{removed} items removed from staging.")
@@ -327,10 +333,43 @@ def commit_to_patch(storage: Storage, patch_name: str) -> PatchMetadata:
 
 
 def _matches_paths(file_path: str, filter_paths: list[str]) -> bool:
+    """Check if file_path matches any filter. Supports:
+    - Exact match: /etc/config.conf
+    - Directory prefix: /etc/ or /etc
+    - Glob patterns: /etc/*.conf (single * does NOT cross /)
+    - Recursive glob: /etc/**/*.json
+    """
+    import fnmatch
+    import re
+
     for p in filter_paths:
-        if file_path == p or file_path.startswith(p.rstrip("/") + "/"):
+        if file_path == p:
+            return True
+
+        if "**" in p:
+            if _matches_recursive_glob(file_path, p):
+                return True
+        elif "*" in p or "?" in p:
+            # Convert glob to regex where * doesn't cross /
+            # * → [^/]*, ? → [^/]
+            regex = re.escape(p).replace(r"\*", "[^/]*").replace(r"\?", "[^/]")
+            if re.fullmatch(regex, file_path):
+                return True
+        elif file_path.startswith(p.rstrip("/") + "/"):
             return True
     return False
+
+
+def _matches_recursive_glob(path: str, pattern: str) -> bool:
+    """Match pattern with ** against path. ** crosses directory boundaries."""
+    import re
+    # Convert: /etc/**/*.json → /etc/.*/[^/]*\.json
+    # First escape, then replace \*\* with .*, then \* with [^/]*
+    regex = re.escape(pattern)
+    regex = regex.replace(r"\*\*", "DOUBLE_STAR_MARKER")
+    regex = regex.replace(r"\*", "[^/]*").replace(r"\?", "[^/]")
+    regex = regex.replace("DOUBLE_STAR_MARKER", ".*")
+    return bool(re.fullmatch(regex, path))
 
 
 # ======================================================================

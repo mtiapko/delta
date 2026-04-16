@@ -1118,3 +1118,96 @@ class TestNewFeatures:
             r = CliRunner().invoke(main, ["cache", "clean", "--yes"])
             assert r.exit_code == 0
             assert not cf.exists()
+
+
+class TestPathPatterns:
+    def test_exact_match(self):
+        from delta.staging_ops import _matches_paths
+        assert _matches_paths("/etc/config.conf", ["/etc/config.conf"])
+        assert not _matches_paths("/etc/other.conf", ["/etc/config.conf"])
+
+    def test_directory_prefix(self):
+        from delta.staging_ops import _matches_paths
+        assert _matches_paths("/etc/config.conf", ["/etc/"])
+        assert _matches_paths("/etc/sub/file", ["/etc/"])
+        assert _matches_paths("/etc/config.conf", ["/etc"])  # without trailing /
+        assert not _matches_paths("/opt/file", ["/etc/"])
+
+    def test_glob_star(self):
+        from delta.staging_ops import _matches_paths
+        assert _matches_paths("/etc/config.conf", ["/etc/*.conf"])
+        assert _matches_paths("/etc/app.conf", ["/etc/*.conf"])
+        assert not _matches_paths("/etc/config.json", ["/etc/*.conf"])
+        assert not _matches_paths("/etc/sub/config.conf", ["/etc/*.conf"])  # single * doesn't cross /
+
+    def test_glob_recursive(self):
+        from delta.staging_ops import _matches_paths
+        assert _matches_paths("/var/log/app.log", ["/var/**/*.log"])
+        assert _matches_paths("/var/a/b/app.log", ["/var/**/*.log"])
+        assert not _matches_paths("/var/log/app.json", ["/var/**/*.log"])
+
+    def test_question_mark(self):
+        from delta.staging_ops import _matches_paths
+        assert _matches_paths("/etc/a.conf", ["/etc/?.conf"])
+        assert not _matches_paths("/etc/ab.conf", ["/etc/?.conf"])
+
+    def test_multiple_patterns(self):
+        from delta.staging_ops import _matches_paths
+        assert _matches_paths("/etc/a.conf", ["/etc/*.conf", "/var/*.log"])
+        assert _matches_paths("/var/x.log", ["/etc/*.conf", "/var/*.log"])
+        assert not _matches_paths("/opt/x", ["/etc/*.conf", "/var/*.log"])
+
+    def test_stage_remove_pattern(self, storage):
+        from delta.staging_ops import stage_remove
+        storage.save_staging(StagingManifest(
+            reference="bl",
+            modified=["/etc/a.conf", "/etc/b.conf", "/etc/c.json"],
+        ))
+        # Create staged files
+        for name in ("a.conf", "b.conf", "c.json"):
+            f = storage.get_staging_file(f"/etc/{name}")
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("x")
+
+        stage_remove(storage, ["/etc/*.conf"])
+        m = storage.load_staging()
+        assert "/etc/a.conf" not in m.modified
+        assert "/etc/b.conf" not in m.modified
+        assert "/etc/c.json" in m.modified  # .json not affected
+
+
+class TestStatusCompression:
+    def test_print_compressed_many_files(self, capsys):
+        from delta.cli import _print_compressed
+        # 5 files in same dir → should collapse
+        paths = [f"/etc/conf/a{i}.conf" for i in range(5)]
+        _print_compressed(paths, "M", threshold=3)
+        captured = capsys.readouterr()
+        assert "/etc/conf/" in captured.err or "/etc/conf/" in captured.out
+        assert "5 files" in (captured.err + captured.out)
+
+    def test_print_compressed_few_files(self, capsys):
+        from delta.cli import _print_compressed
+        # 2 files → show individually
+        paths = ["/etc/a.conf", "/etc/b.conf"]
+        _print_compressed(paths, "M", threshold=3)
+        out = capsys.readouterr().err + capsys.readouterr().out
+        # Neither "2 files" nor collapse
+        assert "2 files" not in out
+
+    def test_diff_staged_flag(self):
+        from click.testing import CliRunner
+        from delta.cli import main
+        r = CliRunner().invoke(main, ["diff", "--help"])
+        assert "--staged" in r.output or "--cached" in r.output
+
+    def test_diff_staged_empty(self, tmp_path):
+        from click.testing import CliRunner
+        from delta.cli import main
+        with CliRunner().isolated_filesystem(temp_dir=tmp_path):
+            s = Storage(root=Path.cwd())
+            s.init(DeltaConfig(ssh=SSHConfig(host="h")))
+            s.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
+            s.save_state(DeltaState(active="bl"))
+            r = CliRunner().invoke(main, ["diff", "--staged"])
+            assert r.exit_code == 0
