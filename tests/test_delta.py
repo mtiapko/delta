@@ -1211,3 +1211,88 @@ class TestStatusCompression:
             s.save_state(DeltaState(active="bl"))
             r = CliRunner().invoke(main, ["diff", "--staged"])
             assert r.exit_code == 0
+
+
+class TestStagingManifestSources:
+    def test_stage_add_marks_cache(self, storage):
+        from delta.staging_ops import stage_add
+        storage.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
+        dr = DiffResult(reference_name="bl", reference_type=EntityType.BASELINE,
+                        modified=[FileInfo(path="/etc/a", md5="abc")])
+        stage_add(storage, dr)
+        m = storage.load_staging()
+        assert m.sources.get("/etc/a") == "cache"
+
+    def test_stage_add_local_marks_local(self, storage):
+        from delta.staging_ops import stage_add_local
+        storage.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
+        local = storage.delta_dir.parent / "myfile"
+        local.write_text("data")
+        stage_add_local(storage, "/etc/new", local, "bl", EntityType.BASELINE)
+        m = storage.load_staging()
+        assert m.sources.get("/etc/new") == "local"
+
+    def test_resolve_cache(self, storage):
+        m = StagingManifest(reference="bl", modified=["/etc/a"], sources={"/etc/a": "cache"})
+        cf = storage.cache_files_dir / "etc" / "a"
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        cf.write_text("cached")
+        resolved = storage.resolve_staged_file(m, "/etc/a")
+        assert resolved == cf
+
+    def test_resolve_local(self, storage):
+        m = StagingManifest(reference="bl", modified=["/etc/a"], sources={"/etc/a": "local"})
+        sf = storage.get_staging_file("/etc/a")
+        sf.parent.mkdir(parents=True, exist_ok=True)
+        sf.write_text("local")
+        resolved = storage.resolve_staged_file(m, "/etc/a")
+        assert resolved == sf
+
+    def test_resolve_fallback(self, storage):
+        m = StagingManifest(reference="bl", modified=["/etc/a"])  # No sources
+        cf = storage.cache_files_dir / "etc" / "a"
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        cf.write_text("cached")
+        resolved = storage.resolve_staged_file(m, "/etc/a")
+        assert resolved == cf
+
+    def test_commit_updated_count(self, storage):
+        """Re-committing same file shows 'updated', not '0 new'."""
+        from delta.staging_ops import create_patch, commit_to_patch
+        storage.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
+        storage.save_state(DeltaState(active="bl"))
+        create_patch(storage, "p1")
+
+        # First commit
+        storage.save_staging(StagingManifest(reference="bl", modified=["/etc/a"]))
+        cf = storage.cache_files_dir / "etc" / "a"
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        cf.write_text("v1")
+        commit_to_patch(storage, "p1")
+
+        # Second commit — same file, updated
+        storage.save_staging(StagingManifest(reference="bl", modified=["/etc/a"],
+                                            sources={"/etc/a": "cache"}))
+        cf.write_text("v2")
+        meta = commit_to_patch(storage, "p1")
+        assert "/etc/a" in meta.modified_files
+        # File content should be v2
+        pf = storage.get_patch_file("p1", "/etc/a")
+        assert pf.read_text() == "v2"
+
+    def test_no_file_duplication(self, storage):
+        """stage_add should NOT copy files from cache to staging."""
+        from delta.staging_ops import stage_add
+        storage.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
+        # Put file in cache
+        cf = storage.cache_files_dir / "etc" / "a"
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        cf.write_text("cached")
+
+        dr = DiffResult(reference_name="bl", reference_type=EntityType.BASELINE,
+                        modified=[FileInfo(path="/etc/a", md5="abc")])
+        stage_add(storage, dr)
+
+        # Staging files dir should NOT have the file
+        sf = storage.get_staging_file("/etc/a")
+        assert not sf.exists()

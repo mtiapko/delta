@@ -296,7 +296,29 @@ class Storage:
             manifest.unlink()
 
     def get_staging_file(self, remote_path: str) -> Path:
+        """Get the path where local staged files live (for --file, --force, edit)."""
         return self.staging_files_dir / remote_path.lstrip("/")
+
+    def resolve_staged_file(self, manifest: StagingManifest, remote_path: str) -> Path | None:
+        """Resolve a staged file's actual location based on its source.
+
+        Priority: explicit source → fallback to both locations.
+        """
+        source = manifest.sources.get(remote_path)
+        if source == "local":
+            p = self.get_staging_file(remote_path)
+            return p if p.exists() else None
+        if source == "cache":
+            p = self.cache_files_dir / remote_path.lstrip("/")
+            return p if p.exists() else None
+        # No source recorded — try cache first, then staging (backward compat)
+        cache_p = self.cache_files_dir / remote_path.lstrip("/")
+        if cache_p.exists():
+            return cache_p
+        staging_p = self.get_staging_file(remote_path)
+        if staging_p.exists():
+            return staging_p
+        return None
 
     # ------------------------------------------------------------------
     # Templates

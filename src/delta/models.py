@@ -174,6 +174,8 @@ class StagingManifest:
     modified: list[str] = field(default_factory=list)
     created: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
+    # path → "cache" (file lives in .delta/cache/files/) or "local" (in .delta/staging/files/)
+    sources: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"reference": self.reference}
@@ -183,12 +185,19 @@ class StagingManifest:
             d["created"] = self.created
         if self.deleted:
             d["deleted"] = self.deleted
+        if self.sources:
+            d["sources"] = self.sources
         return d
 
     @classmethod
     def from_dict(cls, d: dict) -> StagingManifest:
-        return cls(reference=d.get("reference", ""), modified=d.get("modified", []),
-                   created=d.get("created", []), deleted=d.get("deleted", []))
+        return cls(
+            reference=d.get("reference", ""),
+            modified=d.get("modified", []),
+            created=d.get("created", []),
+            deleted=d.get("deleted", []),
+            sources=d.get("sources", {}),
+        )
 
     @property
     def is_empty(self) -> bool:
@@ -205,6 +214,7 @@ class StagingManifest:
         for lst in (self.modified, self.created, self.deleted):
             if path in lst:
                 lst.remove(path)
+                self.sources.pop(path, None)
                 return True
         return False
 

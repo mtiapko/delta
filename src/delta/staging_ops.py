@@ -137,7 +137,10 @@ def stage_add(
     diff_result: DiffResult,
     paths: list[str] | None = None,
 ) -> StagingManifest:
-    """Add files to staging. paths=None means all."""
+    """Add files to staging. paths=None means all.
+
+    Files are NOT copied — manifest records that they live in cache.
+    """
     from delta import ui
 
     manifest = storage.load_staging()
@@ -153,36 +156,23 @@ def stage_add(
         add_del = [p for p in diff_result.deleted if _matches_paths(p, paths)]
 
     added = 0
-    files_to_copy: list[str] = []
 
     for finfo in add_mod:
         if finfo.path not in manifest.modified:
             manifest.modified.append(finfo.path)
-            if not finfo.is_symlink:
-                files_to_copy.append(finfo.path)
+            manifest.sources[finfo.path] = "cache"
             added += 1
 
     for finfo in add_new:
         if finfo.path not in manifest.created:
             manifest.created.append(finfo.path)
-            if not finfo.is_symlink:
-                files_to_copy.append(finfo.path)
+            manifest.sources[finfo.path] = "cache"
             added += 1
 
     for rpath in add_del:
         if rpath not in manifest.deleted:
             manifest.deleted.append(rpath)
             added += 1
-
-    # Copy fetched files from cache to staging
-    cache_dir = storage.cache_files_dir
-    staging_dir = storage.staging_files_dir
-    for rpath in files_to_copy:
-        src = cache_dir / rpath.lstrip("/")
-        if src.exists():
-            dst = staging_dir / rpath.lstrip("/")
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(src), str(dst))
 
     storage.save_staging(manifest)
     if added:
@@ -196,17 +186,19 @@ def stage_remove(storage: Storage, paths: list[str]) -> StagingManifest:
     from delta import ui
     manifest = storage.load_staging()
 
-    # Collect all staged paths, find those matching any pattern
     all_staged = list(manifest.modified) + list(manifest.created) + list(manifest.deleted)
     to_remove = [p for p in all_staged if _matches_paths(p, paths)]
 
     removed = 0
     for path in to_remove:
+        source = manifest.sources.get(path, "cache")
         if manifest.remove_file(path):
             removed += 1
-            staged = storage.get_staging_file(path)
-            if staged.exists():
-                staged.unlink()
+            # Only unlink if file lives in staging (local), never touch cache
+            if source == "local":
+                staged = storage.get_staging_file(path)
+                if staged.exists():
+                    staged.unlink()
 
     storage.save_staging(manifest)
     if removed:
@@ -258,52 +250,62 @@ def commit_to_patch(storage: Storage, patch_name: str) -> PatchMetadata:
 
     meta = storage.load_patch(patch_name)
     patch_files_dir = storage.patch_files_dir(patch_name)
-    staging_files = storage.staging_files_dir
 
     # Merge file lists
-    new_modified = 0
-    new_created = 0
-    new_deleted = 0
+    new_files = 0
+    updated_files = 0
+    missing_files: list[str] = []
 
     for rpath in manifest.modified:
-        # Copy file to patch dir
-        src = staging_files / rpath.lstrip("/")
-        if src.exists():
+        src = storage.resolve_staged_file(manifest, rpath)
+        if src:
             dst = patch_files_dir / rpath.lstrip("/")
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
-        # Add to modified list if not already there
+        else:
+            missing_files.append(rpath)
+            continue
+
         if rpath not in meta.modified_files:
-            # Maybe it was in created_files before
-            if rpath in meta.created_files:
-                pass  # Already tracked as created, just update the file
-            else:
+            if rpath not in meta.created_files:
                 meta.modified_files.append(rpath)
-                new_modified += 1
+                new_files += 1
+            # else: already tracked as created, just file updated
+        else:
+            updated_files += 1
 
     for rpath in manifest.created:
-        src = staging_files / rpath.lstrip("/")
-        if src.exists():
+        src = storage.resolve_staged_file(manifest, rpath)
+        if src:
             dst = patch_files_dir / rpath.lstrip("/")
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
+        else:
+            missing_files.append(rpath)
+            continue
+
         if rpath not in meta.created_files and rpath not in meta.modified_files:
             meta.created_files.append(rpath)
-            new_created += 1
+            new_files += 1
 
     for rpath in manifest.deleted:
         if rpath not in meta.deleted_files:
             meta.deleted_files.append(rpath)
-            new_deleted += 1
-        # Remove from modified/created if was there
+            new_files += 1
         if rpath in meta.modified_files:
             meta.modified_files.remove(rpath)
         if rpath in meta.created_files:
             meta.created_files.remove(rpath)
-        # Remove file from patch dir if exists
         f = patch_files_dir / rpath.lstrip("/")
         if f.exists():
             f.unlink()
+
+    if missing_files:
+        ui.print_warning(
+            f"{len(missing_files)} files not found (cache cleared?): "
+            + ", ".join(missing_files[:3])
+            + ("..." if len(missing_files) > 3 else "")
+        )
 
     # Update symlink targets from scan
     scan = storage.load_scan()
@@ -323,11 +325,16 @@ def commit_to_patch(storage: Storage, patch_name: str) -> PatchMetadata:
     storage.save_patch(meta)
     storage.clear_staging()
 
-    total_new = new_modified + new_created + new_deleted
     total_all = len(meta.modified_files) + len(meta.created_files) + len(meta.deleted_files)
+    parts = []
+    if new_files:
+        parts.append(f"{new_files} new")
+    if updated_files:
+        parts.append(f"{updated_files} updated")
+    changes = ", ".join(parts) if parts else "no new"
     ui.print_success(
         f"Committed to '{patch_name}': "
-        f"+{total_new} new changes, {total_all} total in patch."
+        f"{changes}, {total_all} total in patch."
     )
     return meta
 
@@ -409,6 +416,7 @@ def stage_add_local(
             manifest.created.append(remote_path)
         change_type = "A"
 
+    manifest.sources[remote_path] = "local"
     storage.save_staging(manifest)
     ui.print_file_change(change_type, remote_path)
     ui.print_success(f"Staged from local file.")
@@ -467,6 +475,7 @@ def stage_add_force(
 
         if rpath not in manifest.modified:
             manifest.modified.append(rpath)
+        manifest.sources[rpath] = "local"
         added += 1
         ui.print_file_change("M", f"{rpath} (force)")
 

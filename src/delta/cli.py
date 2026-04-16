@@ -447,8 +447,8 @@ def _print_staged_diff(storage, manifest, ref_name, ref_type, *,
     # Modified — line-by-line diff
     for rpath in modified:
         old = _resolve_entity_file(storage, ref_name, ref_type, rpath)
-        new = storage.get_staging_file(rpath)
-        _print_unified_diff(rpath, old, new if new.exists() else None,
+        new = storage.resolve_staged_file(manifest, rpath)
+        _print_unified_diff(rpath, old, new,
                             f"{ref_type.value}/{ref_name}", "staged")
 
     # Created
@@ -456,9 +456,9 @@ def _print_staged_diff(storage, manifest, ref_name, ref_type, *,
         _click.echo(_click.style(f"\n{'─' * 60}", fg="cyan"))
         if show_new_deleted:
             for rpath in created:
-                new = storage.get_staging_file(rpath)
+                new = storage.resolve_staged_file(manifest, rpath)
                 from delta.diff_ops import _print_new_file
-                _print_new_file(rpath, new if new.exists() else None)
+                _print_new_file(rpath, new)
         else:
             _click.echo(_click.style("  Added files:", fg="green", bold=True))
             for rpath in created:
@@ -647,8 +647,18 @@ def apply(ctx: DeltaContext, name: str | None, host: str, port: int | None,
 
         # Validate variables in commands
         from delta.remote_cmd import check_undefined_variables, substitute_variables
-        defined_vars = set(ctx.var_map.keys()) | {v.name for v in meta.variables} | set(meta.command_outputs.keys())
+        # Built-in vars + --var + variable specs + command_outputs + save_output keys
+        defined_vars = (
+            set(ctx.var_map.keys())
+            | {v.name for v in meta.variables}
+            | set(meta.command_outputs.keys())
+            | {"PATCH_HASH", "PATCH_NAME"}
+        )
+        # Commands with save_output define vars for later commands
         all_cmds = meta.on_apply.pre + meta.on_apply.post + meta.on_fetch.pre + meta.on_fetch.post
+        for cmd in all_cmds:
+            if cmd.save_output and cmd.output_key:
+                defined_vars.add(cmd.output_key)
         undefined = check_undefined_variables(all_cmds, defined_vars)
         if undefined:
             ui.print_error(f"Undefined variables in commands: {', '.join(undefined)}")
