@@ -1,0 +1,49 @@
+# Example baseline configuration file
+# Use with: delta init <n> --host <host> --config-file baseline-config.yaml
+# Also works with: delta diff <n> --config-file patch-config.yaml
+
+description: "Factory config for ${DEVICE_ID}, kernel: ${kernel_info}"
+
+tracked_paths:
+  - /etc
+  - /opt/app
+  - /home/user/.config
+
+ignore_patterns:
+  - '.*\.log$'
+  - '.*\.tmp$'
+  - '.*\.cache/'
+  - '__pycache__'
+  - '\.pyc$'
+
+variables:
+  - name: DEVICE_ID
+    required: true
+    description: "Unique device identifier"
+  - name: ENV
+    required: false
+    default: "production"
+    description: "Environment (production, staging, dev)"
+
+on_capture:
+  pre:
+    - cmd: "systemctl stop myservice"
+    - cmd: "cat /etc/os-release"
+      save_output: true
+      output_key: os_release
+    - cmd: "uname -r"
+      save_output: true
+      output_key: kernel_info
+    - cmd: "cat /etc/optional.conf"
+      save_output: true
+      output_key: optional_conf
+      optional: true
+  post:
+    - cmd: "systemctl start myservice"
+
+on_apply:
+  pre:
+    - cmd: "systemctl stop myservice"
+  post:
+    - cmd: "systemctl daemon-reload"
+    - cmd: "systemctl start myservice"
