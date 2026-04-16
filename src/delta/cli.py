@@ -1206,14 +1206,20 @@ def patch_commit(ctx: DeltaContext, yes: bool) -> None:
 @patch.command("info")
 @click.argument("name", required=False)
 @click.option("--detailed", "-d", is_flag=True, help="Show diffs vs baseline.")
+@click.option("--hash", "show_hash", is_flag=True, help="Print only the hash (for scripts).")
 @pass_ctx
-def patch_info(ctx: DeltaContext, name: str | None, detailed: bool) -> None:
+def patch_info(ctx: DeltaContext, name: str | None, detailed: bool, show_hash: bool) -> None:
     """Show patch details and file list."""
     ctx.require_init()
     n = name or ctx.get_state().active
     if not n:
         ui.print_error("No patch specified.")
         sys.exit(1)
+
+    if show_hash:
+        click.echo(ctx.storage.compute_patch_hash(n))
+        return
+
     m = ctx.storage.load_patch(n)
     patch_hash = ctx.storage.compute_patch_hash(n)
     ui.print_header(f"Patch: {m.name}")
