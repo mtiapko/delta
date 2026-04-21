@@ -484,17 +484,26 @@ def _print_staged_diff(storage, manifest, ref_name, ref_type, *,
 # ======================================================================
 
 @main.command()
+@click.argument("paths", nargs=-1)
+@click.option("--all", "-a", "show_all", is_flag=True, help="Show all files individually (no compression).")
 @pass_ctx
-def status(ctx: DeltaContext) -> None:
+def status(ctx: DeltaContext, paths: tuple[str, ...], show_all: bool) -> None:
     """Show current state: reference, changes, staging.
 
     \b
-    Shows changes grouped like 'git status': staged files shown individually,
-    unstaged changes with many files in a directory are shown as the directory.
+    Without arguments: shows all changes. With paths/patterns: filter.
+
+    \b
+    Examples:
+      delta status                    # All changes
+      delta status /etc/              # Only /etc/ changes
+      delta status "/etc/*.conf"      # Glob pattern
+      delta status --all              # No directory compression
     """
     ctx.require_init()
     state = ctx.get_state()
     config = ctx.get_config()
+    filter_paths = list(paths) if paths else None
 
     ui.print_header("Delta Status")
     ui.print_info(f"SSH: {config.ssh.user}@{config.ssh.host}:{config.ssh.port}")
@@ -510,17 +519,27 @@ def status(ctx: DeltaContext) -> None:
     scan = ctx.storage.load_scan()
     manifest = ctx.storage.load_staging()
 
-    # Staged changes — show individually (like git)
-    if not manifest.is_empty:
-        ui.print_info(f"\nChanges to be committed (staging vs {manifest.reference}):")
-        for p in sorted(manifest.modified):
+    from delta.staging_ops import _matches_paths
+
+    # Staged changes — show individually
+    staged_mod = sorted(manifest.modified)
+    staged_new = sorted(manifest.created)
+    staged_del = sorted(manifest.deleted)
+    if filter_paths:
+        staged_mod = [p for p in staged_mod if _matches_paths(p, filter_paths)]
+        staged_new = [p for p in staged_new if _matches_paths(p, filter_paths)]
+        staged_del = [p for p in staged_del if _matches_paths(p, filter_paths)]
+
+    if staged_mod or staged_new or staged_del:
+        ui.print_info(f"\nChanges to be committed (vs {manifest.reference}):")
+        for p in staged_mod:
             ui.print_file_change("M", p)
-        for p in sorted(manifest.created):
+        for p in staged_new:
             ui.print_file_change("A", p)
-        for p in sorted(manifest.deleted):
+        for p in staged_del:
             ui.print_file_change("D", p)
 
-    # Unstaged changes — compress directories
+    # Unstaged changes — compress directories unless --all
     if scan and state.active:
         ui.print_info(f"\nLast fetch: {ui.format_time_ago(scan.timestamp)} from {scan.host} (vs {scan.reference})")
 
@@ -528,35 +547,46 @@ def status(ctx: DeltaContext) -> None:
         ref_type = ctx.storage.get_entity_type(state.active)
         diff_result = compare_with_reference(ctx.storage, scan, state.active, ref_type)
 
-        # Filter out staged
         unstaged_mod = [f.path for f in diff_result.modified if f.path not in manifest.modified]
         unstaged_new = [f.path for f in diff_result.created if f.path not in manifest.created]
         unstaged_del = [p for p in diff_result.deleted if p not in manifest.deleted]
 
+        if filter_paths:
+            unstaged_mod = [p for p in unstaged_mod if _matches_paths(p, filter_paths)]
+            unstaged_new = [p for p in unstaged_new if _matches_paths(p, filter_paths)]
+            unstaged_del = [p for p in unstaged_del if _matches_paths(p, filter_paths)]
+
         if unstaged_mod or unstaged_new or unstaged_del:
+            threshold = 0 if show_all else 3
             ui.print_info("\nChanges not staged for commit:")
-            _print_compressed(unstaged_mod, "M")
-            _print_compressed(unstaged_new, "A")
-            _print_compressed(unstaged_del, "D")
-        elif manifest.is_empty:
+            _print_compressed(unstaged_mod, "M", threshold=threshold)
+            _print_compressed(unstaged_new, "A", threshold=threshold)
+            _print_compressed(unstaged_del, "D", threshold=threshold)
+        elif manifest.is_empty and not filter_paths:
             ui.print_success("No changes vs reference.")
     elif not scan:
         ui.print_info("\nLast fetch: (none)")
 
 
 def _print_compressed(paths: list[str], change_type: str, threshold: int = 3) -> None:
-    """Print paths, collapsing directories with many files of same type."""
+    """Print paths, collapsing directories with many files of same type.
+
+    threshold=0 disables compression (show all individually).
+    """
     if not paths:
         return
 
-    # Group by parent directory
+    if threshold <= 0:
+        for p in sorted(paths):
+            ui.print_file_change(change_type, p)
+        return
+
     from collections import defaultdict
     by_dir: dict[str, list[str]] = defaultdict(list)
     for p in paths:
         parent = os.path.dirname(p) or "/"
         by_dir[parent].append(p)
 
-    # For each directory, either show files or collapse
     shown: set[str] = set()
     for parent in sorted(by_dir.keys()):
         files = by_dir[parent]
@@ -564,7 +594,6 @@ def _print_compressed(paths: list[str], change_type: str, threshold: int = 3) ->
             ui.print_file_change(change_type, f"{parent}/  ({len(files)} files)")
             shown.update(files)
 
-    # Show remaining files individually
     for p in sorted(paths):
         if p not in shown:
             ui.print_file_change(change_type, p)
@@ -652,7 +681,7 @@ def apply(ctx: DeltaContext, name: str | None, host: str, port: int | None,
             set(ctx.var_map.keys())
             | {v.name for v in meta.variables}
             | set(meta.command_outputs.keys())
-            | {"PATCH_HASH", "PATCH_NAME"}
+            | {"PATCH_HASH", "PATCH_NAME", "PATCH_DESC"}
         )
         # Commands with save_output define vars for later commands
         all_cmds = meta.on_apply.pre + meta.on_apply.post + meta.on_fetch.pre + meta.on_fetch.post
@@ -666,7 +695,8 @@ def apply(ctx: DeltaContext, name: str | None, host: str, port: int | None,
 
         # Show plan
         from delta.apply_ops import _print_apply_plan
-        _print_apply_plan(meta, config.ssh.host, ctx.var_map)
+        _print_apply_plan(meta, config.ssh.host, ctx.var_map,
+                         patch_hash=ctx.storage.compute_patch_hash(patch_name))
 
         if dry_run:
             ui.print_info("\n(dry run — no changes applied)")
@@ -1093,7 +1123,8 @@ def patch_edit(ctx: DeltaContext, remote_path: str) -> None:
     """Edit a file and stage it in the patch.
 
     \b
-    Opens the file from baseline/patch in your editor.
+    If the file is already staged, opens the staged version.
+    Otherwise, opens from baseline/patch reference.
     After saving, the file is staged for commit.
 
     \b
@@ -1101,7 +1132,6 @@ def patch_edit(ctx: DeltaContext, remote_path: str) -> None:
       delta patch edit /etc/config.conf
     """
     ctx.require_init()
-    import shutil
     import tempfile
 
     state = ctx.get_state()
@@ -1111,15 +1141,20 @@ def patch_edit(ctx: DeltaContext, remote_path: str) -> None:
         sys.exit(1)
     ref_type = ctx.storage.get_entity_type(ref_name)
 
-    # Find source file
-    from delta.diff_ops import _resolve_entity_file
-    src = _resolve_entity_file(ctx.storage, ref_name, ref_type, remote_path)
-
     config = ctx.get_config()
     editor = config.editor or os.environ.get("EDITOR", "") or os.environ.get("VISUAL", "")
     if not editor:
         ui.print_error("No editor. Set 'editor' in config or $EDITOR.")
         sys.exit(1)
+
+    # Find source: staged > cache > reference
+    manifest = ctx.storage.load_staging()
+    src = None
+    if manifest.has_file(remote_path):
+        src = ctx.storage.resolve_staged_file(manifest, remote_path)
+    if not src:
+        from delta.diff_ops import _resolve_entity_file
+        src = _resolve_entity_file(ctx.storage, ref_name, ref_type, remote_path)
 
     with tempfile.NamedTemporaryFile(suffix="_" + os.path.basename(remote_path),
                                      mode="w", delete=False) as tmp:
@@ -1129,9 +1164,10 @@ def patch_edit(ctx: DeltaContext, remote_path: str) -> None:
         else:
             ui.print_info(f"Creating new file: {remote_path}")
 
+    original = tmp_path.read_bytes() if tmp_path.exists() else b""
     os.system(f"{editor} {tmp_path}")
 
-    if not tmp_path.exists() or (src and src.exists() and tmp_path.read_bytes() == src.read_bytes()):
+    if not tmp_path.exists() or tmp_path.read_bytes() == original:
         ui.print_info("No changes.")
         tmp_path.unlink(missing_ok=True)
         return

@@ -36,6 +36,7 @@ def apply_patch(
     all_vars: dict[str, str] = dict(meta.command_outputs)
     all_vars["PATCH_HASH"] = storage.compute_patch_hash(patch_name)
     all_vars["PATCH_NAME"] = patch_name
+    all_vars["PATCH_DESC"] = meta.description
     all_vars.update(resolved_vars)
 
     # Validate variables
@@ -126,12 +127,16 @@ def apply_patch(
     ui.print_success(f"Patch '{patch_name}' applied.")
 
 
-def _print_apply_plan(meta: PatchMetadata, host: str = "", var_map: dict[str, str] | None = None) -> None:
+def _print_apply_plan(meta: PatchMetadata, host: str = "", var_map: dict[str, str] | None = None,
+                     patch_hash: str = "") -> None:
     from delta import ui
     from delta.remote_cmd import substitute_variables
 
     var_map = var_map or {}
     all_vars = dict(meta.command_outputs)
+    all_vars["PATCH_HASH"] = patch_hash
+    all_vars["PATCH_NAME"] = meta.name
+    all_vars["PATCH_DESC"] = meta.description
     all_vars.update(var_map)
 
     ui.print_header(f"Apply: {meta.name} → {host or '(host)'}")
