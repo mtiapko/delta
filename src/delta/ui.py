@@ -18,10 +18,10 @@ from delta.exceptions import AbortedError
 
 logger = logging.getLogger("delta")
 
-# Ensure delta logger always has a stderr handler (for read-only commands
+# Ensure delta logger always has a stdout handler (for read-only commands
 # that don't call setup_logging). LogManager replaces this on start().
 if not logger.handlers:
-    _default_handler = logging.StreamHandler(sys.stderr)
+    _default_handler = logging.StreamHandler(sys.stdout)
     _default_handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(_default_handler)
     logger.setLevel(logging.DEBUG)
