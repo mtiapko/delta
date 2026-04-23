@@ -289,7 +289,8 @@ class TestCLI:
         from delta.cli import main
         r = CliRunner().invoke(main, ["--help"])
         assert r.exit_code == 0
-        for cmd in ("init", "fetch", "diff", "apply", "checkout", "use", "status", "patch", "baseline"):
+        for cmd in ("init", "fetch", "diff", "apply", "checkout", "use", "status",
+                    "add", "commit", "reset", "edit", "patch", "baseline"):
             assert cmd in r.output
 
     def test_fetch_help(self):
@@ -311,7 +312,7 @@ class TestCLI:
         from click.testing import CliRunner
         from delta.cli import main
         r = CliRunner().invoke(main, ["patch", "--help"])
-        for sub in ("create", "add", "remove", "commit", "info"):
+        for sub in ("create", "info", "rm"):
             assert sub in r.output
 
     def test_use(self, tmp_path):
@@ -376,10 +377,10 @@ class TestCLI:
             r = CliRunner().invoke(main, ["checkout", "/etc/cfg", "--dry-run"])
             assert r.exit_code == 0
 
-    def test_patch_add_requires_args(self):
+    def test_add_requires_args(self):
         from click.testing import CliRunner
         from delta.cli import main
-        r = CliRunner().invoke(main, ["patch", "add"])
+        r = CliRunner().invoke(main, ["add"])
         assert r.exit_code == 2  # Missing required arg
 
 
@@ -771,16 +772,14 @@ class TestPatchCommitCLI:
             s.init(DeltaConfig(ssh=SSHConfig(host="h")))
             s.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
             s.save_state(DeltaState(active="bl"))
-            r = CliRunner().invoke(main, ["patch", "commit"])
+            r = CliRunner().invoke(main, ["commit"])
             assert r.exit_code == 1  # Active is baseline, not patch
 
-    def test_commit_no_args(self):
+    def test_commit_help(self):
         from click.testing import CliRunner
         from delta.cli import main
-        r = CliRunner().invoke(main, ["patch", "commit", "--help"])
-        assert "commit" in r.output
-        # No NAME argument in help
-        assert "NAME" not in r.output
+        r = CliRunner().invoke(main, ["commit", "--help"])
+        assert "commit" in r.output.lower()
 
 
 class TestVariableValidation:

@@ -115,99 +115,31 @@ def main(ctx: click.Context, show_config: bool, work_dir: str) -> None:
 
 
 # ======================================================================
-# delta init (SSH)
+# delta init
 # ======================================================================
 
 @main.command()
-@click.argument("name")
-@click.option("--host", required=True)
-@click.option("--port", default=22)
-@click.option("--user", default="root")
-@click.option("--key-file", default="")
-@click.option("--path", "-p", "tracked_paths", multiple=True, required=True)
-@click.option("--description", "-d", default="")
-@click.option("--ignore", "-i", "ignore_patterns", multiple=True)
-@click.option("--pre-cmd", multiple=True)
-@click.option("--post-cmd", multiple=True)
-@click.option("--config-file", type=click.Path(exists=True))
-@click.option("--template", "template_name", default="")
-@click.option("--compress/--no-compress", default=None)
-@click.option("--skip-pre-cmds", is_flag=True)
-@click.option("--skip-post-cmds", is_flag=True)
-@click.option("--yes", "-y", is_flag=True, help="Skip confirmations.")
-@click.option("--var", "-V", multiple=True, help="Variable: KEY=VALUE.")
+@click.option("--host", default="", help="Default SSH host.")
+@click.option("--editor", default="", help="Default editor.")
 @pass_ctx
-def init(ctx: DeltaContext, name: str, host: str, port: int, user: str,
-         key_file: str, tracked_paths: tuple[str, ...], description: str,
-         ignore_patterns: tuple[str, ...], pre_cmd: tuple[str, ...],
-         post_cmd: tuple[str, ...], config_file: str | None,
-         template_name: str, compress: bool | None,
-         skip_pre_cmds: bool, skip_post_cmds: bool,
-         yes: bool, var: tuple[str, ...]) -> None:
-    """Initialize delta and create the first baseline."""
-    _apply_yes(ctx, yes)
-    _apply_vars(ctx, var)
-    success = False
-    try:
-        ssh_config = SSHConfig(host=host, port=port, user=user, key_file=key_file)
-        delta_config = DeltaConfig(ssh=ssh_config)
-        if ctx.storage.is_initialized:
-            delta_config = ctx.storage.load_config()
-            delta_config.ssh = ssh_config
-            ctx.storage.save_config(delta_config)
-        else:
-            ctx.storage.init(delta_config)
-        lm = ctx.setup_logging("init")
+def init(ctx: DeltaContext, host: str, editor: str) -> None:
+    """Initialize delta in current directory.
 
-        tmpl = _load_template(ctx.storage, template_name or delta_config.default_baseline_template)
-        merged = merge_settings(
-            template=tmpl, config_file=_load_config_file(config_file),
-            cli_pre_cmd=_parse_cmd_args(pre_cmd) or None,
-            cli_post_cmd=_parse_cmd_args(post_cmd) or None,
-            cli_ignore=list(ignore_patterns) if ignore_patterns else None,
-            cli_description=description)
+    \b
+    Creates .delta/ with default config.
+    Then use 'delta baseline create' to scan a device.
+    """
+    if ctx.storage.is_initialized:
+        ui.print_warning("Already initialized.")
+        return
+    config = DeltaConfig()
+    if host:
+        config.ssh.host = host
+    if editor:
+        config.editor = editor
+    ctx.storage.init(config)
+    ui.print_success(f"Initialized .delta/ in {ctx.storage.delta_dir.parent}")
 
-        on_fetch = merged["on_fetch"]
-        if skip_pre_cmds:
-            on_fetch = CommandBlock(pre=[], post=on_fetch.post)
-        if skip_post_cmds:
-            on_fetch = CommandBlock(pre=on_fetch.pre, post=[])
-
-        if ctx.storage.name_exists(name):
-            ui.confirm_or_abort(f"'{name}' already exists. Overwrite?", auto_yes=ctx.auto_yes)
-            ctx.storage.remove_baseline(name)
-
-        from delta.baseline_ops import create_baseline
-        from delta.connection import Connection
-        if compress is not None:
-            delta_config.transfer.compress = compress
-        with Connection(ssh_config, delta_config.transfer) as conn:
-            meta = create_baseline(
-                conn, ctx.storage, name=name, tracked_paths=list(tracked_paths),
-                description=merged["description"], ignore_patterns=merged["ignore_patterns"],
-                variables=merged["variables"], on_fetch=on_fetch, resolved_vars=ctx.var_map)
-
-        state = ctx.get_state()
-        state.active = name
-        ctx.save_state(state)
-        ui.print_success(f"Baseline '{name}' created and set as active.")
-        ui.print_info(f"Files: {meta.file_count}  Size: {ui.format_size(meta.total_size)}")
-        success = True
-    except AbortedError:
-        ctx._cancelled = True
-        ui.print_info("Cancelled.")
-    except KeyboardInterrupt:
-        ui.print_warning("\nInterrupted.")
-        ctx._interrupted = True
-    except DeltaError as e:
-        _handle_error(e)
-    except Exception as e:
-        ui.print_error(f"Unexpected error: {e}")
-        logger.exception("init failed")
-    finally:
-        ctx.finish_logging(success)
-        if not success:
-            sys.exit(130 if ctx._interrupted else 1)
 
 
 # ======================================================================
@@ -617,6 +549,231 @@ def use(ctx: DeltaContext, name: str) -> None:
 
 
 # ======================================================================
+# delta add (top-level staging)
+# ======================================================================
+
+@main.command()
+@click.argument("paths", nargs=-1, required=True)
+@click.option("--file", "-f", "local_file", default="", help="Local file as content.")
+@click.option("--delete", is_flag=True, help="Mark for deletion on device.")
+@click.option("--force", is_flag=True, help="Add from baseline even if unchanged.")
+@click.option("--fetch", "do_fetch", is_flag=True, help="Fetch before staging.")
+@pass_ctx
+def add(ctx: DeltaContext, paths: tuple[str, ...], local_file: str,
+        delete: bool, force: bool, do_fetch: bool) -> None:
+    """Stage files for next commit.
+
+    \b
+    Examples:
+      delta add .                               # All device changes
+      delta add /etc/config.conf                # One file
+      delta add "/etc/*.conf"                   # Glob
+      delta add /etc/app.conf --file ./my.conf  # Local file
+      delta add /etc/old.conf --delete          # Delete on device
+      delta add /etc/config.conf --force        # From baseline
+    """
+    ctx.require_init()
+    state = ctx.get_state()
+    ref_name = state.active
+    if not ref_name:
+        ui.print_error("No active reference.")
+        sys.exit(1)
+    ref_type = ctx.storage.get_entity_type(ref_name)
+    if local_file:
+        if len(paths) != 1:
+            ui.print_error("--file requires exactly one target path.")
+            sys.exit(1)
+        src = Path(local_file)
+        if not src.exists():
+            ui.print_error(f"File not found: {local_file}")
+            sys.exit(1)
+        from delta.staging_ops import stage_add_local
+        stage_add_local(ctx.storage, paths[0], src, ref_name, ref_type)
+        return
+    if delete:
+        from delta.staging_ops import stage_add_delete
+        stage_add_delete(ctx.storage, list(paths))
+        return
+    if force:
+        from delta.staging_ops import stage_add_force
+        stage_add_force(ctx.storage, list(paths), ref_name, ref_type)
+        return
+    if do_fetch:
+        ctx.invoke(fetch)
+    scan = _require_scan(ctx)
+    _validate_cache(scan, ctx.get_config(), ref_name)
+    from delta.diff_ops import compare_with_reference
+    from delta.staging_ops import stage_add
+    dr = compare_with_reference(ctx.storage, scan, ref_name, ref_type)
+    stage_add(ctx.storage, dr, None if "." in paths else list(paths))
+
+
+# ======================================================================
+# delta reset (unstage)
+# ======================================================================
+
+@main.command()
+@click.argument("paths", nargs=-1, required=True)
+@pass_ctx
+def reset(ctx: DeltaContext, paths: tuple[str, ...]) -> None:
+    """Remove files from staging.
+
+    \b
+    Examples:
+      delta reset /etc/config.conf
+      delta reset "/etc/*.conf"
+    """
+    ctx.require_init()
+    from delta.staging_ops import stage_remove
+    stage_remove(ctx.storage, list(paths))
+
+
+# ======================================================================
+# delta commit
+# ======================================================================
+
+@main.command("commit")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation.")
+@pass_ctx
+def commit_cmd(ctx: DeltaContext, yes: bool) -> None:
+    """Commit staged changes into the active patch."""
+    ctx.require_init()
+    _apply_yes(ctx, yes)
+    lm = ctx.setup_logging("commit")
+    success = False
+    try:
+        state = ctx.get_state()
+        if not state.active:
+            ui.print_error("No active patch. Use 'delta patch create <n>' first.")
+            sys.exit(1)
+        t = ctx.storage.get_entity_type(state.active)
+        if t != EntityType.PATCH:
+            ui.print_error(f"Active '{state.active}' is a baseline. Use 'delta patch create <n>'.")
+            sys.exit(1)
+        from delta.staging_ops import stage_status, commit_to_patch
+        manifest = stage_status(ctx.storage)
+        if manifest.is_empty:
+            ui.print_error("Nothing to commit.")
+            sys.exit(1)
+        ui.confirm_or_abort(f"Commit {manifest.total_files} changes to '{state.active}'?",
+                            auto_yes=ctx.auto_yes)
+        commit_to_patch(ctx.storage, state.active)
+        success = True
+    except AbortedError:
+        ctx._cancelled = True
+        ui.print_info("Cancelled.")
+    except ValueError as e:
+        ui.print_error(str(e))
+    except DeltaError as e:
+        _handle_error(e)
+    finally:
+        ctx.finish_logging(success)
+        if not success:
+            sys.exit(1)
+
+
+# ======================================================================
+# delta edit (smart)
+# ======================================================================
+
+@main.command()
+@click.argument("target")
+@click.argument("name", required=False, default="")
+@click.option("--scaffold", is_flag=True, help="Add commented examples of all fields.")
+@pass_ctx
+def edit(ctx: DeltaContext, target: str, name: str, scaffold: bool) -> None:
+    """Edit a file or metadata.
+
+    \b
+    If target starts with / → edit device file and stage it.
+    Otherwise → open metadata/config in editor.
+
+    \b
+    Examples:
+      delta edit /etc/config.conf       # Edit file, auto-stage
+      delta edit config                 # Edit config.yaml
+      delta edit ignore                 # Edit .delta/ignore
+      delta edit patch [name]           # Edit patch metadata
+      delta edit baseline [name]        # Edit baseline metadata
+      delta edit template name          # Edit/create template
+    """
+    ctx.require_init()
+
+    if target.startswith("/"):
+        _edit_and_stage_file(ctx, target)
+        return
+
+    config = ctx.get_config()
+    editor_cmd = config.editor or os.environ.get("EDITOR", "") or os.environ.get("VISUAL", "")
+    if not editor_cmd:
+        ui.print_error("No editor. Set 'editor' in config or $EDITOR.")
+        sys.exit(1)
+    try:
+        if target == "ignore":
+            path = ctx.storage.delta_dir / "ignore"
+            if not path.exists():
+                path.write_text(_SCAFFOLD_IGNORE)
+                ui.print_info(f"Created: {path}")
+        else:
+            edit_name = name
+            if not edit_name and target in ("patch", "baseline"):
+                edit_name = ctx.get_state().active
+                if not edit_name:
+                    ui.print_error(f"No {target} specified and no active reference.")
+                    sys.exit(1)
+            path = ctx.storage.get_edit_path(target, edit_name)
+            if target == "template" and not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(_SCAFFOLD_TEMPLATE if scaffold else "# Delta template\n")
+                ui.print_info(f"Created: {path}")
+        if scaffold and path.exists() and target != "ignore":
+            _inject_scaffold(path, target)
+            ui.print_info("Scaffold comments added.")
+        os.system(f"{editor_cmd} {path}")
+    except DeltaError as e:
+        ui.print_error(str(e))
+        sys.exit(1)
+
+
+def _edit_and_stage_file(ctx: DeltaContext, remote_path: str) -> None:
+    import tempfile
+    state = ctx.get_state()
+    ref_name = state.active
+    if not ref_name:
+        ui.print_error("No active reference.")
+        sys.exit(1)
+    ref_type = ctx.storage.get_entity_type(ref_name)
+    config = ctx.get_config()
+    editor_cmd = config.editor or os.environ.get("EDITOR", "") or os.environ.get("VISUAL", "")
+    if not editor_cmd:
+        ui.print_error("No editor.")
+        sys.exit(1)
+    manifest = ctx.storage.load_staging()
+    src = None
+    if manifest.has_file(remote_path):
+        src = ctx.storage.resolve_staged_file(manifest, remote_path)
+    if not src:
+        from delta.diff_ops import _resolve_entity_file
+        src = _resolve_entity_file(ctx.storage, ref_name, ref_type, remote_path)
+    with tempfile.NamedTemporaryFile(suffix="_" + os.path.basename(remote_path),
+                                     mode="w", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        if src and src.exists():
+            tmp_path.write_bytes(src.read_bytes())
+        else:
+            ui.print_info(f"Creating new file: {remote_path}")
+    original = tmp_path.read_bytes() if tmp_path.exists() else b""
+    os.system(f"{editor_cmd} {tmp_path}")
+    if not tmp_path.exists() or tmp_path.read_bytes() == original:
+        ui.print_info("No changes.")
+        tmp_path.unlink(missing_ok=True)
+        return
+    from delta.staging_ops import stage_add_local
+    stage_add_local(ctx.storage, remote_path, tmp_path, ref_name, ref_type)
+    tmp_path.unlink(missing_ok=True)
+
+
+# ======================================================================
 # delta apply (SSH)
 # ======================================================================
 
@@ -875,9 +1032,101 @@ def baseline(ctx: click.Context) -> None:
         dctx.require_init()
         entities = [e for e in dctx.storage.list_all_entities() if e["type"] == "baseline"]
         if not entities:
-            ui.print_info("No baselines. Use 'delta init'.")
+            ui.print_info("No baselines. Use 'delta baseline create'.")
             return
         ui.print_entity_list(entities, active=dctx.get_state().active)
+
+@baseline.command("create")
+@click.argument("name")
+@click.option("--host", default="")
+@click.option("--port", default=22)
+@click.option("--user", default="root")
+@click.option("--key-file", default="")
+@click.option("--path", "-p", "tracked_paths", multiple=True, required=True)
+@click.option("--description", "-d", default="")
+@click.option("--ignore", "-i", "ignore_patterns", multiple=True)
+@click.option("--pre-cmd", multiple=True)
+@click.option("--post-cmd", multiple=True)
+@click.option("--config-file", type=click.Path(exists=True))
+@click.option("--template", "template_name", default="")
+@click.option("--compress/--no-compress", default=None)
+@click.option("--skip-pre-cmds", is_flag=True)
+@click.option("--skip-post-cmds", is_flag=True)
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmations.")
+@click.option("--var", "-V", multiple=True, help="Variable: KEY=VALUE.")
+@pass_ctx
+def baseline_create(ctx: DeltaContext, name: str, host: str, port: int, user: str,
+                    key_file: str, tracked_paths: tuple[str, ...], description: str,
+                    ignore_patterns: tuple[str, ...], pre_cmd: tuple[str, ...],
+                    post_cmd: tuple[str, ...], config_file: str | None,
+                    template_name: str, compress: bool | None,
+                    skip_pre_cmds: bool, skip_post_cmds: bool,
+                    yes: bool, var: tuple[str, ...]) -> None:
+    """Create a baseline by scanning a device (SSH)."""
+    ctx.require_init()
+    _apply_yes(ctx, yes)
+    _apply_vars(ctx, var)
+    success = False
+    try:
+        config = ctx.get_config()
+        ssh_config = SSHConfig(
+            host=host or config.ssh.host, port=port, user=user, key_file=key_file)
+        if not ssh_config.host:
+            ui.print_error("No host. Use --host or 'delta config set ssh.host <ip>'.")
+            sys.exit(1)
+        config.ssh = ssh_config
+        ctx.storage.save_config(config)
+        lm = ctx.setup_logging("baseline_create")
+
+        tmpl = _load_template(ctx.storage, template_name or config.default_baseline_template)
+        merged = merge_settings(
+            template=tmpl, config_file=_load_config_file(config_file),
+            cli_pre_cmd=_parse_cmd_args(pre_cmd) or None,
+            cli_post_cmd=_parse_cmd_args(post_cmd) or None,
+            cli_ignore=list(ignore_patterns) if ignore_patterns else None,
+            cli_description=description)
+
+        on_fetch = merged["on_fetch"]
+        if skip_pre_cmds:
+            on_fetch = CommandBlock(pre=[], post=on_fetch.post)
+        if skip_post_cmds:
+            on_fetch = CommandBlock(pre=on_fetch.pre, post=[])
+
+        if ctx.storage.name_exists(name):
+            ui.confirm_or_abort(f"'{name}' already exists. Overwrite?", auto_yes=ctx.auto_yes)
+            ctx.storage.remove_baseline(name)
+
+        from delta.baseline_ops import create_baseline
+        from delta.connection import Connection
+        if compress is not None:
+            config.transfer.compress = compress
+        with Connection(ssh_config, config.transfer) as conn:
+            meta = create_baseline(
+                conn, ctx.storage, name=name, tracked_paths=list(tracked_paths),
+                description=merged["description"], ignore_patterns=merged["ignore_patterns"],
+                variables=merged["variables"], on_fetch=on_fetch, resolved_vars=ctx.var_map)
+
+        state = ctx.get_state()
+        state.active = name
+        ctx.save_state(state)
+        ui.print_success(f"Baseline '{name}' created and set as active.")
+        ui.print_info(f"Files: {meta.file_count}  Size: {ui.format_size(meta.total_size)}")
+        success = True
+    except AbortedError:
+        ctx._cancelled = True
+        ui.print_info("Cancelled.")
+    except KeyboardInterrupt:
+        ui.print_warning("\nInterrupted.")
+        ctx._interrupted = True
+    except DeltaError as e:
+        _handle_error(e)
+    except Exception as e:
+        ui.print_error(f"Unexpected error: {e}")
+        logger.exception("baseline create failed")
+    finally:
+        ctx.finish_logging(success)
+        if not success:
+            sys.exit(130 if ctx._interrupted else 1)
 
 @baseline.command("info")
 @click.argument("name", required=False)
@@ -1039,206 +1288,6 @@ def patch_create(ctx: DeltaContext, name: str, from_entity: str, message: str) -
         ui.print_error(str(e))
         sys.exit(1)
 
-@patch.command("add")
-@click.argument("paths", nargs=-1, required=True)
-@click.option("--file", "-f", "local_file", default="", help="Local file to use as content.")
-@click.option("--delete", is_flag=True, help="Mark file for deletion on device.")
-@click.option("--force", is_flag=True, help="Add even if unchanged vs baseline.")
-@click.option("--fetch", "do_fetch", is_flag=True, help="Fetch before staging.")
-@pass_ctx
-def patch_add(ctx: DeltaContext, paths: tuple[str, ...], local_file: str,
-              delete: bool, force: bool, do_fetch: bool) -> None:
-    """Stage files for next commit.
-
-    \b
-    Paths can be:
-      - Exact:    /etc/config.conf
-      - Directory: /etc/ or /etc (matches all files under)
-      - Glob:     /etc/*.conf  /etc/**/*.json  (use quotes in shell)
-      - Special:  . (all changes from device)
-
-    \b
-    Use --file to add a local file (bypasses fetch/diff).
-    Use --delete to mark a file for deletion.
-    Use --force to add from baseline even if unchanged.
-
-    \b
-    Examples:
-      delta patch add .                                  # Stage all device changes
-      delta patch add /etc/config.conf                   # Stage one file
-      delta patch add "/etc/*.conf"                      # Glob pattern
-      delta patch add "/var/**/*.log"                    # Recursive glob
-      delta patch add /etc/app.conf --file ./my.conf     # Local file → device path
-      delta patch add "/etc/*.old" --delete              # Delete matching on device
-      delta patch add /etc/config.conf --force           # Add from baseline
-    """
-    ctx.require_init()
-    state = ctx.get_state()
-    ref_name = state.active
-    if not ref_name:
-        ui.print_error("No active reference.")
-        sys.exit(1)
-    ref_type = ctx.storage.get_entity_type(ref_name)
-
-    # Mode 1: --file (local file → device path)
-    if local_file:
-        if len(paths) != 1:
-            ui.print_error("--file requires exactly one target path.")
-            sys.exit(1)
-        remote_path = paths[0]
-        src = Path(local_file)
-        if not src.exists():
-            ui.print_error(f"File not found: {local_file}")
-            sys.exit(1)
-        from delta.staging_ops import stage_add_local
-        stage_add_local(ctx.storage, remote_path, src, ref_name, ref_type)
-        return
-
-    # Mode 2: --delete (mark for deletion)
-    if delete:
-        from delta.staging_ops import stage_add_delete
-        stage_add_delete(ctx.storage, list(paths))
-        return
-
-    # Mode 3: --force (copy from baseline even if unchanged)
-    if force:
-        from delta.staging_ops import stage_add_force
-        stage_add_force(ctx.storage, list(paths), ref_name, ref_type)
-        return
-
-    # Mode 4: normal (from fetch/diff)
-    if do_fetch:
-        ctx.invoke(fetch)
-    scan = _require_scan(ctx)
-    _validate_cache(scan, ctx.get_config(), ref_name)
-    from delta.diff_ops import compare_with_reference
-    from delta.staging_ops import stage_add
-    dr = compare_with_reference(ctx.storage, scan, ref_name, ref_type)
-    stage_add(ctx.storage, dr, None if "." in paths else list(paths))
-
-@patch.command("edit")
-@click.argument("remote_path")
-@pass_ctx
-def patch_edit(ctx: DeltaContext, remote_path: str) -> None:
-    """Edit a file and stage it in the patch.
-
-    \b
-    If the file is already staged, opens the staged version.
-    Otherwise, opens from baseline/patch reference.
-    After saving, the file is staged for commit.
-
-    \b
-    Examples:
-      delta patch edit /etc/config.conf
-    """
-    ctx.require_init()
-    import tempfile
-
-    state = ctx.get_state()
-    ref_name = state.active
-    if not ref_name:
-        ui.print_error("No active reference.")
-        sys.exit(1)
-    ref_type = ctx.storage.get_entity_type(ref_name)
-
-    config = ctx.get_config()
-    editor = config.editor or os.environ.get("EDITOR", "") or os.environ.get("VISUAL", "")
-    if not editor:
-        ui.print_error("No editor. Set 'editor' in config or $EDITOR.")
-        sys.exit(1)
-
-    # Find source: staged > cache > reference
-    manifest = ctx.storage.load_staging()
-    src = None
-    if manifest.has_file(remote_path):
-        src = ctx.storage.resolve_staged_file(manifest, remote_path)
-    if not src:
-        from delta.diff_ops import _resolve_entity_file
-        src = _resolve_entity_file(ctx.storage, ref_name, ref_type, remote_path)
-
-    with tempfile.NamedTemporaryFile(suffix="_" + os.path.basename(remote_path),
-                                     mode="w", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-        if src and src.exists():
-            tmp_path.write_bytes(src.read_bytes())
-        else:
-            ui.print_info(f"Creating new file: {remote_path}")
-
-    original = tmp_path.read_bytes() if tmp_path.exists() else b""
-    os.system(f"{editor} {tmp_path}")
-
-    if not tmp_path.exists() or tmp_path.read_bytes() == original:
-        ui.print_info("No changes.")
-        tmp_path.unlink(missing_ok=True)
-        return
-
-    from delta.staging_ops import stage_add_local
-    stage_add_local(ctx.storage, remote_path, tmp_path, ref_name, ref_type)
-    tmp_path.unlink(missing_ok=True)
-
-@patch.command("remove")
-@click.argument("paths", nargs=-1, required=True)
-@pass_ctx
-def patch_remove(ctx: DeltaContext, paths: tuple[str, ...]) -> None:
-    """Remove files from staging.
-
-    \b
-    Supports same patterns as 'patch add':
-      - Exact path, directory, or glob.
-
-    \b
-    Examples:
-      delta patch remove /etc/config.conf
-      delta patch remove /etc/
-      delta patch remove "/etc/*.conf"
-    """
-    ctx.require_init()
-    from delta.staging_ops import stage_remove
-    stage_remove(ctx.storage, list(paths))
-
-@patch.command("commit")
-@click.option("--yes", "-y", is_flag=True, help="Skip confirmation.")
-@pass_ctx
-def patch_commit(ctx: DeltaContext, yes: bool) -> None:
-    """Commit staged changes into the active patch."""
-    ctx.require_init()
-    _apply_yes(ctx, yes)
-    lm = ctx.setup_logging("patch_commit")
-    success = False
-    try:
-        state = ctx.get_state()
-        if not state.active:
-            ui.print_error("No active patch. Use 'delta patch create <n>' first.")
-            sys.exit(1)
-        t = ctx.storage.get_entity_type(state.active)
-        if t != EntityType.PATCH:
-            ui.print_error(f"Active '{state.active}' is a baseline. Use 'delta patch create <n>'.")
-            sys.exit(1)
-
-        from delta.staging_ops import stage_status, commit_to_patch
-        manifest = stage_status(ctx.storage)
-        if manifest.is_empty:
-            ui.print_error("Nothing to commit.")
-            sys.exit(1)
-
-        ui.confirm_or_abort(
-            f"Commit {manifest.total_files} changes to '{state.active}'?",
-            auto_yes=ctx.auto_yes,
-        )
-        commit_to_patch(ctx.storage, state.active)
-        success = True
-    except AbortedError:
-        ctx._cancelled = True
-        ui.print_info("Cancelled.")
-    except ValueError as e:
-        ui.print_error(str(e))
-    except DeltaError as e:
-        _handle_error(e)
-    finally:
-        ctx.finish_logging(success)
-        if not success:
-            sys.exit(1)
-
 @patch.command("info")
 @click.argument("name", required=False)
 @click.option("--detailed", "-d", is_flag=True, help="Show diffs vs baseline.")
@@ -1346,66 +1395,6 @@ def template_rm(ctx: DeltaContext, name: str) -> None:
     ctx.require_init()
     ctx.storage.remove_template(name)
     ui.print_success(f"Template '{name}' removed.")
-
-
-# ======================================================================
-# delta edit
-# ======================================================================
-
-@main.command()
-@click.argument("target", type=click.Choice(["config", "template", "baseline", "patch", "ignore"]))
-@click.argument("name", required=False, default="")
-@click.option("--scaffold", is_flag=True, help="Add commented examples of all available fields.")
-@pass_ctx
-def edit(ctx: DeltaContext, target: str, name: str, scaffold: bool) -> None:
-    """Open a file in editor.
-
-    \b
-    Use --scaffold to inject commented examples of all fields
-    you can configure. Existing content is preserved.
-
-    \b
-    Examples:
-      delta edit config                    # Edit config
-      delta edit ignore                    # Edit .delta/ignore
-      delta edit patch wifi                # Edit patch metadata
-      delta edit patch wifi --scaffold     # Add all available fields as comments
-      delta edit template my-tmpl          # Edit/create template
-    """
-    ctx.require_init()
-    config = ctx.get_config()
-    editor = config.editor or os.environ.get("EDITOR", "") or os.environ.get("VISUAL", "")
-    if not editor:
-        ui.print_error("No editor. Set 'editor' in config or $EDITOR.")
-        sys.exit(1)
-    try:
-        if target == "ignore":
-            path = ctx.storage.delta_dir / "ignore"
-            if not path.exists():
-                path.write_text(_SCAFFOLD_IGNORE)
-                ui.print_info(f"Created: {path}")
-        else:
-            # Use active entity if name not specified
-            edit_name = name
-            if not edit_name and target in ("patch", "baseline"):
-                edit_name = ctx.get_state().active
-                if not edit_name:
-                    ui.print_error(f"No {target} specified and no active reference.")
-                    sys.exit(1)
-            path = ctx.storage.get_edit_path(target, edit_name)
-            if target == "template" and not path.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(_SCAFFOLD_TEMPLATE if scaffold else "# Delta template\n")
-                ui.print_info(f"Created: {path}")
-
-        if scaffold and path.exists() and target != "ignore":
-            _inject_scaffold(path, target)
-            ui.print_info("Scaffold comments added.")
-
-        os.system(f"{editor} {path}")
-    except DeltaError as e:
-        _handle_error(e)
-        sys.exit(1)
 
 
 # ======================================================================
