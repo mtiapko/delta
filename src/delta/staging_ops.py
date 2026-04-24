@@ -72,21 +72,11 @@ def create_patch(
     )
 
     if from_type == EntityType.BASELINE:
-        # Inherit settings from baseline (self-contained)
+        # Inherit everything from baseline (self-contained — no config merge)
         bl = storage.load_baseline(from_entity)
-        config = storage.load_config()
         meta.ignore_patterns = list(bl.ignore_patterns)
         meta.variables = list(bl.variables)
-        # Merge: config on_fetch + baseline on_fetch
-        meta.on_fetch = CommandBlock(
-            pre=list(config.on_fetch.pre) + list(bl.on_fetch.pre),
-            post=list(bl.on_fetch.post) + list(config.on_fetch.post),
-        )
-        # Config on_apply (baselines don't have on_apply)
-        meta.on_apply = CommandBlock(
-            pre=list(config.on_apply.pre),
-            post=list(config.on_apply.post),
-        )
+        meta.on_fetch = CommandBlock(pre=list(bl.on_fetch.pre), post=list(bl.on_fetch.post))
         meta.ownership = bl.ownership
         meta.command_outputs = dict(bl.command_outputs)
         if not description and bl.description:

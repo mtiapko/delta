@@ -22,7 +22,6 @@ from delta.models import (
 DELTA_DIR = ".delta"
 CONFIG_FILE = "config.yaml"
 STATE_FILE = "state.yaml"
-IGNORE_FILE = "ignore"
 BASELINES_DIR = "baselines"
 PATCHES_DIR = "patches"
 TEMPLATES_DIR = "templates"
@@ -86,26 +85,6 @@ class Storage:
         path = self.delta_dir / STATE_FILE
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(state.to_dict(), f, default_flow_style=False, sort_keys=False)
-
-    # ------------------------------------------------------------------
-    # Ignore patterns (.delta/ignore — like .gitignore)
-    # ------------------------------------------------------------------
-
-    @property
-    def ignore_file(self) -> Path:
-        return self.delta_dir / IGNORE_FILE
-
-    def load_ignore_patterns(self) -> list[str]:
-        """Load patterns from .delta/ignore. One regex pattern per line. # = comment."""
-        path = self.ignore_file
-        if not path.exists():
-            return []
-        patterns = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                patterns.append(line)
-        return patterns
 
     # ------------------------------------------------------------------
     # Entity namespace (baselines + patches share one namespace)

@@ -147,23 +147,18 @@ def init(ctx: DeltaContext, host: str, editor: str) -> None:
 # ======================================================================
 
 @main.command()
-@click.option("--scan", "scan_only", is_flag=True, help="Only scan checksums, don't download.")
-@click.option("--detailed", "-d", is_flag=True, help="Show line-by-line diffs after fetch.")
+@click.option("--scan", "scan_only", is_flag=True, help="Only scan checksums.")
+@click.option("--detailed", "-d", is_flag=True, help="Show diffs after fetch.")
+@click.option("--show-ignored", is_flag=True, help="Show ignored files.")
 @click.option("--compress/--no-compress", default=None)
 @click.option("--skip-pre-cmds", is_flag=True)
 @click.option("--skip-post-cmds", is_flag=True)
 @click.option("--var", "-V", multiple=True, help="Variable: KEY=VALUE.")
 @pass_ctx
-def fetch(ctx: DeltaContext, scan_only: bool, detailed: bool, compress: bool | None,
+def fetch(ctx: DeltaContext, scan_only: bool, detailed: bool, show_ignored: bool,
+          compress: bool | None,
           skip_pre_cmds: bool, skip_post_cmds: bool, var: tuple[str, ...]) -> None:
-    """Fetch device state: scan checksums and download changed files.
-
-    \b
-    Examples:
-      delta fetch            # Scan + download changes
-      delta fetch --scan     # Only scan checksums (fast)
-      delta fetch -d         # Fetch + show detailed diffs
-    """
+    """Fetch device state: scan checksums and download changed files."""
     ctx.require_init()
     _apply_vars(ctx, var)
 
@@ -198,9 +193,24 @@ def fetch(ctx: DeltaContext, scan_only: bool, detailed: bool, compress: bool | N
             _run_entity_cmds(ctx, conn, ref_name, ref_type, "pre", skip_pre_cmds)
 
             ui.print_phase("SCANNING DEVICE")
-            all_files = conn.list_files(tracked_paths, ignore_patterns or None)
-            total_size = sum(f.size for f in all_files if not f.is_symlink)
-            ui.print_info(f"Found {len(all_files)} files ({ui.format_size(total_size)})")
+            if show_ignored and ignore_patterns:
+                # Scan without patterns, then filter in Python
+                raw_files = conn.list_files(tracked_paths, None)
+                from delta.models import matches_any_pattern
+                all_files = [f for f in raw_files if not matches_any_pattern(f.path, ignore_patterns)]
+                ignored = [f for f in raw_files if matches_any_pattern(f.path, ignore_patterns)]
+                total_size = sum(f.size for f in all_files if not f.is_symlink)
+                ui.print_info(f"Found {len(all_files)} files ({ui.format_size(total_size)}), {len(ignored)} ignored")
+                if ignored:
+                    ui.print_info("\nIgnored files:")
+                    for f in sorted(ignored, key=lambda x: x.path)[:50]:
+                        ui.print_dim(f"  {f.path}")
+                    if len(ignored) > 50:
+                        ui.print_dim(f"  ... and {len(ignored) - 50} more")
+            else:
+                all_files = conn.list_files(tracked_paths, ignore_patterns or None)
+                total_size = sum(f.size for f in all_files if not f.is_symlink)
+                ui.print_info(f"Found {len(all_files)} files ({ui.format_size(total_size)})")
 
             scan = ScanResult(
                 timestamp=datetime.now().isoformat(),
@@ -288,24 +298,20 @@ def fetch(ctx: DeltaContext, scan_only: bool, detailed: bool, compress: bool | N
 @click.option("--staged", "--cached", "staged", is_flag=True,
               help="Show diffs for staged files (like 'git diff --cached').")
 @click.option("--ignore", "-i", "extra_ignore", multiple=True, help="Extra ignore patterns.")
+@click.option("--binary", is_flag=True, help="Show binary file diffs.")
 @pass_ctx
 def diff(ctx: DeltaContext, paths: tuple[str, ...], against_name: str,
-         full: bool, do_fetch: bool, staged: bool, extra_ignore: tuple[str, ...]) -> None:
-    """Show detailed changes between device and reference.
-
-    \b
-    Without arguments: line-by-line diff for all modified files,
-    one-liner for added/deleted. With paths: only matching files.
+         full: bool, do_fetch: bool, staged: bool, extra_ignore: tuple[str, ...],
+         binary: bool) -> None:
+    """Show detailed changes.
 
     \b
     Examples:
-      delta diff                       # Device vs reference
-      delta diff --staged              # Staging vs reference (like git diff --cached)
-      delta diff /etc/wpa.conf         # Only this file
-      delta diff /etc/                 # All changes under /etc/
+      delta diff                       # All changes
+      delta diff "*.conf"              # Glob pattern
+      delta diff --staged              # Staging vs reference
+      delta diff --binary              # Include binary files
       delta diff --full                # Include new/deleted content
-      delta diff --fetch               # Fetch first, then diff
-      delta diff --against factory     # Compare with specific entity
     """
     ctx.require_init()
     if ctx.show_config:
@@ -329,7 +335,7 @@ def diff(ctx: DeltaContext, paths: tuple[str, ...], against_name: str,
                 return
             _print_staged_diff(ctx.storage, manifest, ref_name, ref_type,
                                filter_paths=list(paths) if paths else None,
-                               show_new_deleted=full)
+                               show_new_deleted=full, show_binary=binary)
             return
 
         if do_fetch:
@@ -350,6 +356,7 @@ def diff(ctx: DeltaContext, paths: tuple[str, ...], against_name: str,
             ctx.storage, diff_result, ref_name, ref_type,
             filter_paths=list(paths) if paths else None,
             show_new_deleted=full,
+            show_binary=binary,
         )
 
     except DeltaError as e:
@@ -358,7 +365,7 @@ def diff(ctx: DeltaContext, paths: tuple[str, ...], against_name: str,
 
 
 def _print_staged_diff(storage, manifest, ref_name, ref_type, *,
-                       filter_paths=None, show_new_deleted=False):
+                       filter_paths=None, show_new_deleted=False, show_binary=False):
     """Show diffs for staged files vs reference."""
     from delta.diff_ops import _resolve_entity_file, _print_unified_diff, _path_matches
     import click as _click
@@ -376,12 +383,12 @@ def _print_staged_diff(storage, manifest, ref_name, ref_type, *,
         ui.print_info("No matching staged changes.")
         return
 
-    # Modified — line-by-line diff
     for rpath in modified:
         old = _resolve_entity_file(storage, ref_name, ref_type, rpath)
         new = storage.resolve_staged_file(manifest, rpath)
         _print_unified_diff(rpath, old, new,
-                            f"{ref_type.value}/{ref_name}", "staged")
+                            f"{ref_type.value}/{ref_name}", "staged",
+                            show_binary=show_binary)
 
     # Created
     if created:
@@ -418,8 +425,9 @@ def _print_staged_diff(storage, manifest, ref_name, ref_type, *,
 @main.command()
 @click.argument("paths", nargs=-1)
 @click.option("--all", "-a", "show_all", is_flag=True, help="Show all files individually (no compression).")
+@click.option("--show-ignored", is_flag=True, help="Show active ignore patterns.")
 @pass_ctx
-def status(ctx: DeltaContext, paths: tuple[str, ...], show_all: bool) -> None:
+def status(ctx: DeltaContext, paths: tuple[str, ...], show_all: bool, show_ignored: bool) -> None:
     """Show current state: reference, changes, staging.
 
     \b
@@ -498,6 +506,20 @@ def status(ctx: DeltaContext, paths: tuple[str, ...], show_all: bool) -> None:
             ui.print_success("No changes vs reference.")
     elif not scan:
         ui.print_info("\nLast fetch: (none)")
+
+    # Show active ignore patterns
+    if show_ignored and state.active:
+        ref_type = ctx.storage.get_entity_type(state.active)
+        if ref_type == EntityType.BASELINE:
+            patterns = ctx.storage.load_baseline(state.active).ignore_patterns
+        else:
+            patterns = ctx.storage.load_patch(state.active).ignore_patterns
+        if patterns:
+            ui.print_info(f"\nIgnore patterns ({ref_type.value}/{state.active}):")
+            for p in patterns:
+                ui.print_dim(f"  {p}")
+        else:
+            ui.print_info("\nNo ignore patterns.")
 
 
 def _print_compressed(paths: list[str], change_type: str, threshold: int = 3) -> None:
@@ -692,7 +714,6 @@ def edit(ctx: DeltaContext, target: str, name: str, scaffold: bool) -> None:
     Examples:
       delta edit /etc/config.conf       # Edit file, auto-stage
       delta edit config                 # Edit config.yaml
-      delta edit ignore                 # Edit .delta/ignore
       delta edit patch [name]           # Edit patch metadata
       delta edit baseline [name]        # Edit baseline metadata
       delta edit template name          # Edit/create template
@@ -709,24 +730,18 @@ def edit(ctx: DeltaContext, target: str, name: str, scaffold: bool) -> None:
         ui.print_error("No editor. Set 'editor' in config or $EDITOR.")
         sys.exit(1)
     try:
-        if target == "ignore":
-            path = ctx.storage.delta_dir / "ignore"
-            if not path.exists():
-                path.write_text(_SCAFFOLD_IGNORE)
-                ui.print_info(f"Created: {path}")
-        else:
-            edit_name = name
-            if not edit_name and target in ("patch", "baseline"):
-                edit_name = ctx.get_state().active
-                if not edit_name:
-                    ui.print_error(f"No {target} specified and no active reference.")
-                    sys.exit(1)
-            path = ctx.storage.get_edit_path(target, edit_name)
-            if target == "template" and not path.exists():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(_SCAFFOLD_TEMPLATE if scaffold else "# Delta template\n")
-                ui.print_info(f"Created: {path}")
-        if scaffold and path.exists() and target != "ignore":
+        edit_name = name
+        if not edit_name and target in ("patch", "baseline"):
+            edit_name = ctx.get_state().active
+            if not edit_name:
+                ui.print_error(f"No {target} specified and no active reference.")
+                sys.exit(1)
+        path = ctx.storage.get_edit_path(target, edit_name)
+        if target == "template" and not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_SCAFFOLD_TEMPLATE if scaffold else "# Delta template\n")
+            ui.print_info(f"Created: {path}")
+        if scaffold and path.exists():
             _inject_scaffold(path, target)
             ui.print_info("Scaffold comments added.")
         os.system(f"{editor_cmd} {path}")
@@ -1001,19 +1016,31 @@ def checkout(ctx: DeltaContext, paths: tuple[str, ...], from_name: str,
 @main.command()
 @click.argument("entity_a")
 @click.argument("entity_b")
+@click.argument("paths", nargs=-1)
 @click.option("--detailed", "-d", is_flag=True)
+@click.option("--binary", is_flag=True, help="Show binary file diffs.")
 @pass_ctx
-def compare(ctx: DeltaContext, entity_a: str, entity_b: str, detailed: bool) -> None:
-    """Compare two local entities without SSH."""
+def compare(ctx: DeltaContext, entity_a: str, entity_b: str, paths: tuple[str, ...],
+            detailed: bool, binary: bool) -> None:
+    """Compare two local entities.
+
+    \b
+    Examples:
+      delta compare factory wifi
+      delta compare factory wifi "*.conf"
+      delta compare factory wifi /etc/ -d
+    """
     ctx.require_init()
     try:
         ta = ctx.storage.get_entity_type(entity_a)
         tb = ctx.storage.get_entity_type(entity_b)
         from delta.diff_ops import compare_entities, print_detailed_local_diff, print_diff_summary
         dr = compare_entities(ctx.storage, entity_a, ta, entity_b, tb)
-        print_diff_summary(dr)
+        filter_paths = list(paths) if paths else None
+        print_diff_summary(dr, filter_paths=filter_paths)
         if detailed and dr.modified:
-            print_detailed_local_diff(ctx.storage, dr, entity_a, ta, entity_b, tb)
+            print_detailed_local_diff(ctx.storage, dr, entity_a, ta, entity_b, tb,
+                                      filter_paths=filter_paths, show_binary=binary)
     except DeltaError as e:
         _handle_error(e)
         sys.exit(1)
@@ -1085,6 +1112,16 @@ def baseline_create(ctx: DeltaContext, name: str, host: str, port: int, user: st
             cli_post_cmd=_parse_cmd_args(post_cmd) or None,
             cli_ignore=list(ignore_patterns) if ignore_patterns else None,
             cli_description=description)
+
+        # Inject config.defaults as lowest priority (entity = self-contained)
+        defs = config.defaults
+        if not merged["ignore_patterns"] and defs.ignore_patterns:
+            merged["ignore_patterns"] = list(defs.ignore_patterns)
+        if not merged["variables"] and defs.variables:
+            merged["variables"] = list(defs.variables)
+        if merged["on_fetch"].is_empty and not defs.on_fetch.is_empty:
+            merged["on_fetch"] = CommandBlock(
+                pre=list(defs.on_fetch.pre), post=list(defs.on_fetch.post))
 
         on_fetch = merged["on_fetch"]
         if skip_pre_cmds:
@@ -1289,13 +1326,28 @@ def patch_create(ctx: DeltaContext, name: str, from_entity: str, message: str) -
         sys.exit(1)
 
 @patch.command("info")
-@click.argument("name", required=False)
+@click.argument("args", nargs=-1)
 @click.option("--detailed", "-d", is_flag=True, help="Show diffs vs baseline.")
 @click.option("--hash", "show_hash", is_flag=True, help="Print only the hash (for scripts).")
+@click.option("--binary", is_flag=True, help="Show binary file diffs.")
 @pass_ctx
-def patch_info(ctx: DeltaContext, name: str | None, detailed: bool, show_hash: bool) -> None:
-    """Show patch details and file list."""
+def patch_info(ctx: DeltaContext, args: tuple[str, ...], detailed: bool, show_hash: bool,
+               binary: bool) -> None:
+    """Show patch details and file list.
+
+    \b
+    Examples:
+      delta patch info                   # Active patch
+      delta patch info wifi              # Named patch
+      delta patch info "*.conf"          # Filter active patch files
+      delta patch info wifi "*.conf"     # Filter named patch files
+      delta patch info --hash            # Hash only (scripts)
+    """
     ctx.require_init()
+    from delta.staging_ops import _matches_paths
+
+    # Parse args: first arg may be name, rest are path filters
+    name, filter_paths = _parse_name_and_paths(ctx, args)
     n = name or ctx.get_state().active
     if not n:
         ui.print_error("No patch specified.")
@@ -1320,26 +1372,36 @@ def patch_info(ctx: DeltaContext, name: str | None, detailed: bool, show_hash: b
     if not m.on_fetch.is_empty:
         ui.print_info(f"Fetch commands: {len(m.on_fetch.pre)} pre, {len(m.on_fetch.post)} post")
 
-    # Always show file list
-    total = len(m.modified_files) + len(m.created_files) + len(m.deleted_files)
+    mod = sorted(m.modified_files)
+    cre = sorted(m.created_files)
+    dele = sorted(m.deleted_files)
+    if filter_paths:
+        mod = [f for f in mod if _matches_paths(f, filter_paths)]
+        cre = [f for f in cre if _matches_paths(f, filter_paths)]
+        dele = [f for f in dele if _matches_paths(f, filter_paths)]
+
+    total = len(mod) + len(cre) + len(dele)
     if total:
-        ui.print_info(f"\nFiles ({total}):")
-        for f in sorted(m.modified_files):
+        all_total = len(m.modified_files) + len(m.created_files) + len(m.deleted_files)
+        label = f"Files ({total})" if not filter_paths else f"Files ({total}/{all_total} matching)"
+        ui.print_info(f"\n{label}:")
+        for f in mod:
             ui.print_file_change("M", f)
-        for f in sorted(m.created_files):
+        for f in cre:
             ui.print_file_change("A", f)
-        for f in sorted(m.deleted_files):
+        for f in dele:
             ui.print_file_change("D", f)
     else:
-        ui.print_info("\nNo files (empty patch).")
+        ui.print_info("\nNo files (empty patch)." if not filter_paths else "\nNo matching files.")
 
-    if detailed and m.modified_files:
+    if detailed and mod:
         from delta.diff_ops import _resolve_entity_file, _print_unified_diff
-        for rpath in sorted(m.modified_files):
+        for rpath in mod:
             old = _resolve_entity_file(ctx.storage, m.baseline, EntityType.BASELINE, rpath)
             new = ctx.storage.get_patch_file(n, rpath)
             _print_unified_diff(rpath, old, new if new.exists() else None,
-                                f"baseline/{m.baseline}", f"patch/{n}")
+                                f"baseline/{m.baseline}", f"patch/{n}",
+                                show_binary=binary)
 
 @patch.command("rm")
 @click.argument("name")
@@ -1402,7 +1464,7 @@ def template_rm(ctx: DeltaContext, name: str) -> None:
 # ======================================================================
 
 @main.command()
-@click.argument("target", type=click.Choice(["config", "baseline", "patch", "template", "ignore"]))
+@click.argument("target", type=click.Choice(["config", "baseline", "patch", "template"]))
 def schema(target: str) -> None:
     """Show all available fields for a config/metadata type.
 
@@ -1418,7 +1480,6 @@ def schema(target: str) -> None:
         "baseline": _SCHEMA_BASELINE,
         "patch": _SCHEMA_PATCH,
         "template": _SCHEMA_TEMPLATE,
-        "ignore": _SCHEMA_IGNORE,
     }
     click.echo(schemas[target])
 
@@ -1436,9 +1497,14 @@ Config (.delta/config.yaml):
     method            (string)   Transfer method: auto|rsync|tar|sftp [auto]
     compress          (bool)     Enable rsync compression [false]
   editor              (string)   Editor for 'delta edit' [$EDITOR]
+  defaults:                      Copied into new baselines/patches at creation
+    ignore_patterns   (list)     Default regex patterns to exclude
+    variables         (list)     Default variable definitions
+    on_fetch          (block)    Default fetch commands
+    on_apply          (block)    Default apply commands
   templates:
-    default_patch     (string)   Default template for patch commit
-    default_baseline  (string)   Default template for init
+    default_patch     (string)   Default template for patch create
+    default_baseline  (string)   Default template for baseline create
   log:
     enabled           (bool)     Enable log file creation [true]
     filename_pattern  (string)   Log filename pattern
@@ -1512,30 +1578,7 @@ Template (.delta/templates/<name>.yaml):
   on_fetch          (block)    Default fetch commands (same as baseline/patch)
   on_apply            (block)    Default apply commands (same as patch)"""
 
-_SCHEMA_IGNORE = """\
-Ignore file (.delta/ignore):
-  One regex pattern per line. Lines starting with # are comments.
-  Patterns are matched against full file paths (e.g. /etc/app.log).
-  Applied globally to all operations (fetch, diff, patch add).
 
-  Examples:
-    .*\\.log$              # All .log files
-    .*\\.tmp$              # All .tmp files
-    .*__pycache__.*        # Python cache
-    /etc/machine-id        # Specific file
-    /var/log/.*            # Everything under /var/log/"""
-
-
-# Scaffold content
-_SCAFFOLD_IGNORE = """\
-# Delta ignore patterns (one regex per line)
-# These are applied globally to all operations.
-#
-# .*\\.log$
-# .*\\.tmp$
-# .*__pycache__.*
-# /etc/machine-id
-"""
 
 _SCAFFOLD_TEMPLATE = """\
 # Delta template — uncomment and fill in fields you need.
@@ -1978,6 +2021,30 @@ def _require_scan(ctx: DeltaContext):
         ui.print_error("No cached data. Run 'delta fetch' first.")
         sys.exit(1)
     return scan
+
+
+def _parse_name_and_paths(ctx: DeltaContext, args: tuple[str, ...]) -> tuple[str | None, list[str] | None]:
+    """Parse mixed args: first may be entity name, rest are path filters.
+
+    Rules:
+    - If arg contains * or ? or starts with / → path pattern
+    - If arg exists as entity name → name
+    - Otherwise → treated as name (will error later if not found)
+    """
+    if not args:
+        return None, None
+    first = args[0]
+    rest = list(args[1:])
+    is_pattern = "*" in first or "?" in first or first.startswith("/")
+    if is_pattern:
+        return None, list(args)
+    # Try as entity name
+    try:
+        ctx.storage.get_entity_type(first)
+        return first, rest if rest else None
+    except Exception:
+        # Not an entity — maybe all are patterns
+        return None, list(args)
 
 def _validate_cache(scan, config: DeltaConfig, expected_ref: str) -> None:
     if scan.host and config.ssh.host and scan.host != config.ssh.host:

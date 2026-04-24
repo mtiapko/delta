@@ -32,36 +32,22 @@ logger = logging.getLogger("delta")
 # Ignore patterns
 # ======================================================================
 
-def load_ignore_file(storage: Storage) -> list[str]:
-    """Load patterns from .delta/ignore file."""
-    path = storage.delta_dir / "ignore"
-    if not path.exists():
-        return []
-    patterns = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            patterns.append(line)
-    return patterns
-
-
 def collect_ignore_patterns(
     storage: Storage,
     ref_name: str,
     ref_type: EntityType,
     extra_ignore: list[str] | None = None,
 ) -> list[str]:
-    """Collect all ignore patterns: .delta/ignore + metadata + CLI."""
-    patterns = load_ignore_file(storage)
+    """Collect ignore patterns from entity metadata + CLI.
+
+    Entity is self-contained — no global config reading at runtime.
+    """
+    patterns: list[str] = []
 
     if ref_type == EntityType.BASELINE:
         patterns.extend(storage.load_baseline(ref_name).ignore_patterns)
     else:
         pm = storage.load_patch(ref_name)
-        try:
-            patterns.extend(storage.load_baseline(pm.baseline).ignore_patterns)
-        except Exception:
-            pass
         patterns.extend(pm.ignore_patterns)
 
     if extra_ignore:
@@ -105,10 +91,7 @@ def resolve_config(
         except Exception:
             bl = None
 
-    # Ignore patterns (accumulated, with sources)
-    for p in load_ignore_file(storage):
-        rc.ignore_patterns.append(TrackedValue(p, ".delta/ignore"))
-
+    # Ignore patterns (from entity metadata only — self-contained)
     if ref_type == EntityType.BASELINE:
         bl_meta = storage.load_baseline(ref_name)
         for p in bl_meta.ignore_patterns:
@@ -254,20 +237,29 @@ def compare_entities(
 # Display — summary (for delta status)
 # ======================================================================
 
-def print_diff_summary(diff_result: DiffResult) -> None:
-    """Print compact one-line-per-file summary. Used by status and fetch."""
+def print_diff_summary(diff_result: DiffResult, *, filter_paths: list[str] | None = None) -> None:
+    """Print compact one-line-per-file summary."""
     from delta import ui
-    if not diff_result.has_changes:
-        ui.print_success("No changes detected.")
+    modified = sorted(diff_result.modified, key=lambda x: x.path)
+    created = sorted(diff_result.created, key=lambda x: x.path)
+    deleted = sorted(diff_result.deleted)
+    if filter_paths:
+        modified = [f for f in modified if _path_matches(f.path, filter_paths)]
+        created = [f for f in created if _path_matches(f.path, filter_paths)]
+        deleted = [p for p in deleted if _path_matches(p, filter_paths)]
+    if not modified and not created and not deleted:
+        ui.print_success("No matching changes.")
         return
     ui.print_header(f"Changes vs {diff_result.reference_name}")
-    for f in sorted(diff_result.modified, key=lambda x: x.path):
+    for f in modified:
         ui.print_file_change("M", f.path)
-    for f in sorted(diff_result.created, key=lambda x: x.path):
+    for f in created:
         ui.print_file_change("A", f.path)
-    for p in sorted(diff_result.deleted):
+    for p in deleted:
         ui.print_file_change("D", p)
-    _print_totals(diff_result)
+    _print_totals(DiffResult(
+        reference_name=diff_result.reference_name, reference_type=diff_result.reference_type,
+        modified=modified, created=created, deleted=deleted))
 
 
 # ======================================================================
@@ -282,17 +274,13 @@ def print_diff(
     *,
     filter_paths: list[str] | None = None,
     show_new_deleted: bool = False,
+    show_binary: bool = False,
 ) -> None:
-    """Print detailed diff: line-by-line for modified, one-liners for A/D.
-
-    If filter_paths given, only show matching files.
-    If show_new_deleted, show content of created/deleted files too.
-    """
+    """Print detailed diff."""
     from delta import ui
     cache_dir = storage.cache_files_dir
     old_label = f"{ref_type.value}/{ref_name}"
 
-    # Filter
     modified = sorted(diff_result.modified, key=lambda x: x.path)
     created = sorted(diff_result.created, key=lambda x: x.path)
     deleted = sorted(diff_result.deleted)
@@ -306,14 +294,14 @@ def print_diff(
         ui.print_info("No matching changes.")
         return
 
-    # Modified — line-by-line diff
     has_cached = False
     for finfo in modified:
         cached = cache_dir / finfo.path.lstrip("/")
         if cached.exists():
             has_cached = True
             old_file = _resolve_entity_file(storage, ref_name, ref_type, finfo.path)
-            _print_unified_diff(finfo.path, old_file, cached, old_label, "device")
+            _print_unified_diff(finfo.path, old_file, cached, old_label, "device",
+                                show_binary=show_binary)
         else:
             ui.print_file_change("M", f"{finfo.path}  (not fetched)")
 
@@ -354,12 +342,18 @@ def print_detailed_local_diff(
     storage: Storage, diff_result: DiffResult,
     name_a: str, type_a: EntityType,
     name_b: str, type_b: EntityType,
+    *, filter_paths: list[str] | None = None,
+    show_binary: bool = False,
 ) -> None:
-    for finfo in sorted(diff_result.modified, key=lambda x: x.path):
+    modified = sorted(diff_result.modified, key=lambda x: x.path)
+    if filter_paths:
+        modified = [f for f in modified if _path_matches(f.path, filter_paths)]
+    for finfo in modified:
         old = _resolve_entity_file(storage, name_a, type_a, finfo.path)
         new = _resolve_entity_file(storage, name_b, type_b, finfo.path)
         _print_unified_diff(finfo.path, old, new,
-                            f"{type_a.value}/{name_a}", f"{type_b.value}/{name_b}")
+                            f"{type_a.value}/{name_a}", f"{type_b.value}/{name_b}",
+                            show_binary=show_binary)
 
 
 # ======================================================================
@@ -433,9 +427,18 @@ def _print_totals(diff_result: DiffResult) -> None:
         ui.print_info(f"\nTotal: {', '.join(parts)}")
 
 
+def _is_binary(path: Path) -> bool:
+    """Check if file is likely binary by reading first 8KB."""
+    try:
+        chunk = path.read_bytes()[:8192]
+        return b"\x00" in chunk
+    except Exception:
+        return True
+
+
 def _print_unified_diff(
     remote_path: str, old_file: Path | None, new_file: Path | None,
-    old_label: str, new_label: str,
+    old_label: str, new_label: str, *, show_binary: bool = False,
 ) -> None:
     click.echo(click.style(f"\n{'─' * 60}", fg="cyan"))
     click.echo(click.style(f"  {remote_path}", fg="yellow", bold=True))
@@ -445,11 +448,22 @@ def _print_unified_diff(
     if not new_file or not new_file.exists():
         click.echo(click.style("  (device file not fetched)", dim=True))
         return
+
+    old_is_bin = _is_binary(old_file)
+    new_is_bin = _is_binary(new_file)
+    if (old_is_bin or new_is_bin) and not show_binary:
+        click.echo(click.style("  Binary files differ", dim=True))
+        old_size = old_file.stat().st_size if old_file.exists() else 0
+        new_size = new_file.stat().st_size
+        if old_size != new_size:
+            click.echo(click.style(f"  {old_size} → {new_size} bytes", dim=True))
+        return
+
     try:
         old_lines = old_file.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
         new_lines = new_file.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
     except Exception:
-        click.echo(click.style("  (binary or unreadable)", dim=True))
+        click.echo(click.style("  (unreadable)", dim=True))
         return
     diff_lines = list(difflib.unified_diff(
         old_lines, new_lines,

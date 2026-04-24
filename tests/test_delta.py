@@ -270,12 +270,13 @@ class TestDiffOps:
         r = compare_entities(storage, "a", EntityType.BASELINE, "b", EntityType.BASELINE)
         assert len(r.modified) == 1 and len(r.created) == 1
 
-    def test_ignore_file(self, storage):
-        """Test .delta/ignore loading."""
-        from delta.diff_ops import load_ignore_file
-        ignore_path = storage.delta_dir / "ignore"
-        ignore_path.write_text("# comment\n.*\\.log$\n\n.*\\.tmp$\n")
-        patterns = load_ignore_file(storage)
+    def test_ignore_patterns_from_entity(self, storage):
+        """Ignore patterns come from entity metadata (self-contained)."""
+        from delta.diff_ops import collect_ignore_patterns
+        storage.save_baseline(BaselineMetadata(
+            name="bl", tracked_paths=["/etc"],
+            ignore_patterns=[".*\\.log$", ".*\\.tmp$"]))
+        patterns = collect_ignore_patterns(storage, "bl", EntityType.BASELINE)
         assert patterns == [".*\\.log$", ".*\\.tmp$"]
 
 
@@ -540,12 +541,13 @@ class TestShowConfig:
         assert any("patch" in s for s in sources)
         assert any("stop" in tv.value for tv in rc.on_apply_pre)
 
-    def test_resolve_config_with_ignore_file(self, storage):
+    def test_resolve_config_with_entity_ignore(self, storage):
         from delta.diff_ops import resolve_config
-        storage.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
-        (storage.delta_dir / "ignore").write_text(".*\\.cache$\n")
+        storage.save_baseline(BaselineMetadata(
+            name="bl", tracked_paths=["/etc"],
+            ignore_patterns=[".*\\.cache$"]))
         rc = resolve_config(storage, "diff", "bl", EntityType.BASELINE)
-        assert any(".delta/ignore" in tv.source for tv in rc.ignore_patterns)
+        assert any("baseline" in tv.source for tv in rc.ignore_patterns)
 
     def test_resolve_config_extra_ignore(self, storage):
         from delta.diff_ops import resolve_config
@@ -629,12 +631,12 @@ class TestSchema:
         assert "on_fetch" in r.output
         assert "on_apply" in r.output
 
-    def test_schema_ignore(self):
+    def test_schema_config_defaults(self):
         from click.testing import CliRunner
         from delta.cli import main
-        r = CliRunner().invoke(main, ["schema", "ignore"])
+        r = CliRunner().invoke(main, ["schema", "config"])
         assert r.exit_code == 0
-        assert "regex" in r.output.lower()
+        assert "defaults" in r.output
 
 
 # ======================================================================
@@ -1078,31 +1080,47 @@ class TestNewFeatures:
         r = CliRunner().invoke(main, ["-C", str(tmp_path), "baseline"])
         assert r.exit_code == 0
 
-    def test_config_on_fetch_on_apply(self):
+    def test_config_defaults(self):
+        from delta.models import ConfigDefaults
         c = DeltaConfig(
-            on_fetch=CommandBlock(pre=[CommandSpec(cmd="echo fetch")]),
-            on_apply=CommandBlock(post=[CommandSpec(cmd="echo apply")]),
+            defaults=ConfigDefaults(
+                on_fetch=CommandBlock(pre=[CommandSpec(cmd="echo fetch")]),
+                on_apply=CommandBlock(post=[CommandSpec(cmd="echo apply")]),
+                ignore_patterns=[".*\\.log$"],
+            ),
         )
         d = c.to_dict()
-        assert "on_fetch" in d
-        assert "on_apply" in d
+        assert "defaults" in d
+        assert "on_fetch" in d["defaults"]
+        assert "on_apply" in d["defaults"]
         c2 = DeltaConfig.from_dict(d)
-        assert len(c2.on_fetch.pre) == 1
-        assert len(c2.on_apply.post) == 1
+        assert len(c2.defaults.on_fetch.pre) == 1
+        assert len(c2.defaults.on_apply.post) == 1
+        assert c2.defaults.ignore_patterns == [".*\\.log$"]
+
+    def test_config_defaults_backward_compat(self):
+        """Old top-level on_fetch/on_apply migrates to defaults."""
+        d = {"on_fetch": {"pre": [{"cmd": "echo old"}]}, "ssh": {"host": "h"}}
+        c = DeltaConfig.from_dict(d)
+        assert len(c.defaults.on_fetch.pre) == 1
 
     def test_config_inherits_to_patch(self, storage):
         from delta.staging_ops import create_patch
-        # Save config with on_apply
+        from delta.models import ConfigDefaults
         config = DeltaConfig(
             ssh=SSHConfig(host="h"),
-            on_apply=CommandBlock(pre=[CommandSpec(cmd="echo global-pre")]),
+            defaults=ConfigDefaults(
+                ignore_patterns=[".*\\.tmp$"],
+            ),
         )
         storage.save_config(config)
-        storage.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
+        storage.save_baseline(BaselineMetadata(
+            name="bl", tracked_paths=["/etc"],
+            ignore_patterns=[".*\\.tmp$"],  # Already inherited at baseline create
+        ))
         storage.save_state(DeltaState(active="bl"))
         meta = create_patch(storage, "p1")
-        assert len(meta.on_apply.pre) == 1
-        assert "global-pre" in meta.on_apply.pre[0].cmd
+        assert ".*\\.tmp$" in meta.ignore_patterns
 
     def test_cache_clean(self, tmp_path):
         from click.testing import CliRunner
@@ -1295,3 +1313,79 @@ class TestStagingManifestSources:
         # Staging files dir should NOT have the file
         sf = storage.get_staging_file("/etc/a")
         assert not sf.exists()
+
+
+class TestBinaryAndFiltering:
+    def test_is_binary(self, tmp_path):
+        from delta.diff_ops import _is_binary
+        text = tmp_path / "a.txt"
+        text.write_text("hello world")
+        assert not _is_binary(text)
+
+        binary = tmp_path / "b.bin"
+        binary.write_bytes(b"\x00\x01\x02\x03")
+        assert _is_binary(binary)
+
+    def test_print_unified_diff_binary(self, tmp_path, capsys):
+        from delta.diff_ops import _print_unified_diff
+        old = tmp_path / "old.bin"
+        new = tmp_path / "new.bin"
+        old.write_bytes(b"\x00" * 100)
+        new.write_bytes(b"\x00" * 200)
+        _print_unified_diff("/etc/binary", old, new, "ref", "dev")
+        out = capsys.readouterr().out
+        assert "Binary files differ" in out
+
+    def test_print_unified_diff_binary_forced(self, tmp_path, capsys):
+        from delta.diff_ops import _print_unified_diff
+        old = tmp_path / "old.bin"
+        new = tmp_path / "new.bin"
+        old.write_bytes(b"\x00" * 10)
+        new.write_bytes(b"\x00" * 20)
+        _print_unified_diff("/etc/binary", old, new, "ref", "dev", show_binary=True)
+        out = capsys.readouterr().out
+        assert "Binary files differ" not in out
+
+    def test_parse_name_and_paths(self, storage):
+        from delta.cli import _parse_name_and_paths
+        storage.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
+
+        class FakeCtx:
+            def __init__(self, s): self.storage = s
+        ctx = FakeCtx(storage)
+
+        # Entity name
+        name, paths = _parse_name_and_paths(ctx, ("bl",))
+        assert name == "bl"
+        assert paths is None
+
+        # Glob pattern
+        name, paths = _parse_name_and_paths(ctx, ("*.conf",))
+        assert name is None
+        assert paths == ["*.conf"]
+
+        # Entity + paths
+        name, paths = _parse_name_and_paths(ctx, ("bl", "*.conf", "*.py"))
+        assert name == "bl"
+        assert paths == ["*.conf", "*.py"]
+
+        # Path starting with /
+        name, paths = _parse_name_and_paths(ctx, ("/etc/",))
+        assert name is None
+        assert paths == ["/etc/"]
+
+        # Empty
+        name, paths = _parse_name_and_paths(ctx, ())
+        assert name is None
+        assert paths is None
+
+    def test_diff_summary_filtered(self, storage):
+        from delta.diff_ops import print_diff_summary
+        dr = DiffResult(
+            reference_name="bl", reference_type=EntityType.BASELINE,
+            modified=[FileInfo(path="/etc/a.conf", md5="x"),
+                      FileInfo(path="/etc/b.py", md5="y")],
+        )
+        # With filter — only .conf
+        # Just verify no crash
+        print_diff_summary(dr, filter_paths=["*.conf"])

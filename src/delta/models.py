@@ -280,8 +280,10 @@ class OwnershipData:
     exceptions: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
+        # Sort exceptions by path for stable serialization
+        sorted_exc = sorted(self.exceptions, key=lambda e: e.get("path", ""))
         return {"default_owner": self.default_owner, "default_group": self.default_group,
-                "default_mode": self.default_mode, "exceptions": self.exceptions}
+                "default_mode": self.default_mode, "exceptions": sorted_exc}
 
     @classmethod
     def from_dict(cls, d: dict) -> OwnershipData:
@@ -442,14 +444,43 @@ class PatchMetadata:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ConfigDefaults:
+    """Default settings copied into new baselines/patches at creation time."""
+    ignore_patterns: list[str] = field(default_factory=list)
+    variables: list[VariableSpec] = field(default_factory=list)
+    on_fetch: CommandBlock = field(default_factory=CommandBlock)
+    on_apply: CommandBlock = field(default_factory=CommandBlock)
+
+    def to_dict(self) -> dict:
+        d: dict[str, Any] = {}
+        if self.ignore_patterns:
+            d["ignore_patterns"] = self.ignore_patterns
+        if self.variables:
+            d["variables"] = [v.to_dict() for v in self.variables]
+        if not self.on_fetch.is_empty:
+            d["on_fetch"] = self.on_fetch.to_dict()
+        if not self.on_apply.is_empty:
+            d["on_apply"] = self.on_apply.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ConfigDefaults:
+        return cls(
+            ignore_patterns=d.get("ignore_patterns", []),
+            variables=[VariableSpec.from_dict(v) for v in d.get("variables", [])],
+            on_fetch=CommandBlock.from_dict(d.get("on_fetch", {})),
+            on_apply=CommandBlock.from_dict(d.get("on_apply", {})),
+        )
+
+
+@dataclass
 class DeltaConfig:
     ssh: SSHConfig = field(default_factory=SSHConfig)
     transfer: TransferConfig = field(default_factory=TransferConfig)
     editor: str = ""
     default_patch_template: str = ""
     default_baseline_template: str = ""
-    on_fetch: CommandBlock = field(default_factory=CommandBlock)
-    on_apply: CommandBlock = field(default_factory=CommandBlock)
+    defaults: ConfigDefaults = field(default_factory=ConfigDefaults)
     log_filename_pattern: str = "{datetime}_{command}_{result}"
     log_max_count: int = 50
     log_max_size_mb: int = 100
@@ -468,24 +499,28 @@ class DeltaConfig:
             d.setdefault("templates", {})["default_patch"] = self.default_patch_template
         if self.default_baseline_template:
             d.setdefault("templates", {})["default_baseline"] = self.default_baseline_template
-        if not self.on_fetch.is_empty:
-            d["on_fetch"] = self.on_fetch.to_dict()
-        if not self.on_apply.is_empty:
-            d["on_apply"] = self.on_apply.to_dict()
+        defaults_d = self.defaults.to_dict()
+        if defaults_d:
+            d["defaults"] = defaults_d
         return d
 
     @classmethod
     def from_dict(cls, d: dict) -> DeltaConfig:
         log = d.get("log", {})
         templates = d.get("templates", {})
+        # Backward compat: on_fetch/on_apply at top level → move to defaults
+        defaults_d = d.get("defaults", {})
+        if "on_fetch" in d and "on_fetch" not in defaults_d:
+            defaults_d["on_fetch"] = d["on_fetch"]
+        if "on_apply" in d and "on_apply" not in defaults_d:
+            defaults_d["on_apply"] = d["on_apply"]
         return cls(
             ssh=SSHConfig.from_dict(d.get("ssh", {})),
             transfer=TransferConfig.from_dict(d.get("transfer", {})),
             editor=d.get("editor", ""),
             default_patch_template=templates.get("default_patch", ""),
             default_baseline_template=templates.get("default_baseline", ""),
-            on_fetch=CommandBlock.from_dict(d.get("on_fetch", {})),
-            on_apply=CommandBlock.from_dict(d.get("on_apply", {})),
+            defaults=ConfigDefaults.from_dict(defaults_d),
             log_filename_pattern=log.get("filename_pattern", "{datetime}_{command}_{result}"),
             log_max_count=log.get("max_count", 50), log_max_size_mb=log.get("max_size_mb", 100),
             log_enabled=log.get("enabled", True),
@@ -628,7 +663,7 @@ def matches_any_pattern(path: str, patterns: list[str]) -> bool:
 class TrackedValue:
     """A value annotated with its source."""
     value: Any
-    source: str  # e.g. ".delta/ignore", "baseline/factory", "template/prod", "--ignore CLI"
+    source: str  # e.g. "baseline/factory", "patch/wifi", "template/prod", "--ignore CLI"
 
     def __str__(self) -> str:
         return f"[{self.source}] {self.value}"
