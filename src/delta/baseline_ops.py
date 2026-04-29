@@ -115,8 +115,13 @@ def refresh_baseline(
     name: str,
     *,
     resolved_vars: dict[str, str] | None = None,
+    force: bool = False,
 ) -> BaselineMetadata:
-    """Re-download all files for an existing baseline."""
+    """Refresh baseline files from device.
+
+    Default: incremental — download new/changed, remove untracked.
+    With force: full re-download from scratch.
+    """
     resolved_vars = resolved_vars or {}
     meta = storage.load_baseline(name)
 
@@ -138,15 +143,52 @@ def refresh_baseline(
     files = conn.list_files(meta.tracked_paths, meta.ignore_patterns)
     regular = [f for f in files if not f.is_symlink]
 
-    ui.print_phase("DOWNLOADING FILES")
     files_dir = storage.baseline_files_dir(name)
-    if files_dir.exists():
-        shutil.rmtree(files_dir)
-    files_dir.mkdir(parents=True)
 
-    file_paths = [f.path for f in regular]
-    if file_paths:
-        conn.download_files(file_paths, files_dir, label="Refreshing baseline")
+    if force:
+        ui.print_phase("DOWNLOADING ALL FILES")
+        if files_dir.exists():
+            shutil.rmtree(files_dir)
+        files_dir.mkdir(parents=True)
+        file_paths = [f.path for f in regular]
+        if file_paths:
+            conn.download_files(file_paths, files_dir, label="Refreshing baseline (full)")
+    else:
+        # Incremental: compare with existing files
+        files_dir.mkdir(parents=True, exist_ok=True)
+
+        # Find existing baseline file checksums
+        from delta.connection import compute_local_md5
+        existing: dict[str, str] = {}
+        for f in files_dir.rglob("*"):
+            if f.is_file():
+                rp = "/" + str(f.relative_to(files_dir))
+                existing[rp] = compute_local_md5(f)
+
+        remote_paths = {f.path for f in regular}
+        remote_md5 = {f.path: f.md5 for f in regular}
+
+        # Download new or changed files
+        to_download = []
+        for f in regular:
+            if f.path not in existing or existing[f.path] != f.md5:
+                to_download.append(f.path)
+
+        # Remove files no longer tracked
+        to_remove = [rp for rp in existing if rp not in remote_paths]
+        if to_remove:
+            for rp in to_remove:
+                fp = files_dir / rp.lstrip("/")
+                if fp.exists():
+                    fp.unlink()
+            ui.print_info(f"Removed {len(to_remove)} untracked files.")
+
+        if to_download:
+            ui.print_phase("DOWNLOADING CHANGES")
+            conn.download_files(to_download, files_dir, label="Refreshing baseline")
+            ui.print_success(f"{len(to_download)} files updated.")
+        else:
+            ui.print_success("Baseline already up to date.")
 
     ownership = compute_ownership(regular)
 

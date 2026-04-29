@@ -45,6 +45,7 @@ class CommandSpec:
     save_output: bool = False
     output_key: str = ""
     optional: bool = False
+    run_once: bool = False
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"cmd": self.cmd}
@@ -53,12 +54,15 @@ class CommandSpec:
             d["output_key"] = self.output_key
         if self.optional:
             d["optional"] = True
+        if self.run_once:
+            d["run_once"] = True
         return d
 
     @classmethod
     def from_dict(cls, d: dict) -> CommandSpec:
         return cls(cmd=d["cmd"], save_output=d.get("save_output", False),
-                   output_key=d.get("output_key", ""), optional=d.get("optional", False))
+                   output_key=d.get("output_key", ""), optional=d.get("optional", False),
+                   run_once=d.get("run_once", False))
 
 
 @dataclass

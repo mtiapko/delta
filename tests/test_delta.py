@@ -1389,3 +1389,84 @@ class TestBinaryAndFiltering:
         # With filter — only .conf
         # Just verify no crash
         print_diff_summary(dr, filter_paths=["*.conf"])
+
+
+class TestRunOnce:
+    def test_command_spec_run_once(self):
+        cs = CommandSpec(cmd="cat /etc/id", save_output=True, output_key="ID", run_once=True)
+        d = cs.to_dict()
+        assert d["run_once"] is True
+        cs2 = CommandSpec.from_dict(d)
+        assert cs2.run_once is True
+
+    def test_run_once_default_false(self):
+        cs = CommandSpec(cmd="echo hi")
+        assert cs.run_once is False
+        d = cs.to_dict()
+        assert "run_once" not in d
+
+
+class TestDeletedFilesBug:
+    def test_delete_created_file_no_phantom(self, storage):
+        """Deleting a file that was only created by this patch should not leave it in deleted_files."""
+        from delta.staging_ops import create_patch, commit_to_patch
+        storage.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
+        storage.save_state(DeltaState(active="bl"))
+        create_patch(storage, "p1")
+
+        # Commit 1: create a new file
+        storage.save_staging(StagingManifest(
+            reference="bl",
+            created=["/opt/new.conf"],
+            sources={"/opt/new.conf": "local"},
+        ))
+        sf = storage.get_staging_file("/opt/new.conf")
+        sf.parent.mkdir(parents=True, exist_ok=True)
+        sf.write_text("new content")
+        commit_to_patch(storage, "p1")
+        m = storage.load_patch("p1")
+        assert "/opt/new.conf" in m.created_files
+
+        # Commit 2: delete the same file
+        storage.save_staging(StagingManifest(
+            reference="bl",
+            deleted=["/opt/new.conf"],
+        ))
+        commit_to_patch(storage, "p1")
+        m = storage.load_patch("p1")
+        # File should NOT be in deleted_files (it doesn't exist in baseline)
+        assert "/opt/new.conf" not in m.deleted_files
+        # File should also be removed from created_files
+        assert "/opt/new.conf" not in m.created_files
+
+    def test_delete_baseline_file_stays_in_deleted(self, storage):
+        """Deleting a file that exists in baseline should stay in deleted_files."""
+        from delta.staging_ops import create_patch, commit_to_patch
+        storage.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
+        # Put a file in baseline
+        bf = storage.baseline_files_dir("bl") / "etc" / "old.conf"
+        bf.parent.mkdir(parents=True, exist_ok=True)
+        bf.write_text("baseline content")
+
+        storage.save_state(DeltaState(active="bl"))
+        create_patch(storage, "p1")
+
+        # First stage the file as modified so it's in modified_files
+        storage.save_staging(StagingManifest(
+            reference="bl",
+            modified=["/etc/old.conf"],
+            sources={"/etc/old.conf": "cache"},
+        ))
+        cf = storage.cache_files_dir / "etc" / "old.conf"
+        cf.parent.mkdir(parents=True, exist_ok=True)
+        cf.write_text("modified")
+        commit_to_patch(storage, "p1")
+
+        # Now delete it
+        storage.save_staging(StagingManifest(
+            reference="bl",
+            deleted=["/etc/old.conf"],
+        ))
+        commit_to_patch(storage, "p1")
+        m = storage.load_patch("p1")
+        assert "/etc/old.conf" in m.deleted_files

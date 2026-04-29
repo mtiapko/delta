@@ -279,13 +279,23 @@ def commit_to_patch(storage: Storage, patch_name: str) -> PatchMetadata:
             new_files += 1
 
     for rpath in manifest.deleted:
-        if rpath not in meta.deleted_files:
-            meta.deleted_files.append(rpath)
-            new_files += 1
+        was_created = rpath in meta.created_files
+        was_modified = rpath in meta.modified_files
+
         if rpath in meta.modified_files:
             meta.modified_files.remove(rpath)
         if rpath in meta.created_files:
             meta.created_files.remove(rpath)
+
+        # Only add to deleted_files if file exists in baseline
+        # (deleting a file that was only created by this patch = just undo)
+        if was_created and not was_modified:
+            # File was only added by this patch, not in baseline → just remove
+            new_files += 1
+        elif rpath not in meta.deleted_files:
+            meta.deleted_files.append(rpath)
+            new_files += 1
+
         f = patch_files_dir / rpath.lstrip("/")
         if f.exists():
             f.unlink()

@@ -102,6 +102,11 @@ def execute_commands(
     collector = ui.get_collector()
 
     for i, cmd_spec in enumerate(commands, 1):
+        # Skip run_once commands if output already recorded
+        if cmd_spec.run_once and cmd_spec.output_key and cmd_spec.output_key in variables:
+            ui.print_dim(f"    [{i}/{len(commands)}] skipped (run_once, {cmd_spec.output_key} already set)")
+            continue
+
         resolved_cmd = substitute_variables(cmd_spec.cmd, variables)
         opt_tag = click.style(" [optional]", dim=True) if cmd_spec.optional else ""
         click.echo(click.style(f"    [{i}/{len(commands)}] ", fg="cyan") + resolved_cmd + opt_tag)

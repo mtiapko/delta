@@ -763,20 +763,36 @@ def _edit_and_stage_file(ctx: DeltaContext, remote_path: str) -> None:
     if not editor_cmd:
         ui.print_error("No editor.")
         sys.exit(1)
+
+    # Find source: staging > cache > reference
     manifest = ctx.storage.load_staging()
     src = None
+    source_label = ""
     if manifest.has_file(remote_path):
         src = ctx.storage.resolve_staged_file(manifest, remote_path)
+        if src:
+            source_label = "staging"
+    if not src:
+        # Try cache
+        cache_path = ctx.storage.cache_files_dir / remote_path.lstrip("/")
+        if cache_path.exists():
+            src = cache_path
+            source_label = "cache"
     if not src:
         from delta.diff_ops import _resolve_entity_file
         src = _resolve_entity_file(ctx.storage, ref_name, ref_type, remote_path)
+        if src:
+            source_label = f"{ref_type.value}/{ref_name}"
+
     with tempfile.NamedTemporaryFile(suffix="_" + os.path.basename(remote_path),
                                      mode="w", delete=False) as tmp:
         tmp_path = Path(tmp.name)
         if src and src.exists():
             tmp_path.write_bytes(src.read_bytes())
+            ui.print_info(f"Editing {remote_path} (from {source_label})")
         else:
             ui.print_info(f"Creating new file: {remote_path}")
+
     original = tmp_path.read_bytes() if tmp_path.exists() else b""
     os.system(f"{editor_cmd} {tmp_path}")
     if not tmp_path.exists() or tmp_path.read_bytes() == original:
@@ -1242,11 +1258,25 @@ def baseline_track(ctx: DeltaContext, path: str, remove: bool) -> None:
 
 @baseline.command("refresh")
 @click.argument("name", required=False)
+@click.option("--force", is_flag=True, help="Full re-download (default: incremental).")
 @click.option("--compress/--no-compress", default=None)
+@click.option("--var", "-V", multiple=True, help="Variable: KEY=VALUE.")
 @pass_ctx
-def baseline_refresh(ctx: DeltaContext, name: str | None, compress: bool | None) -> None:
-    """Re-download baseline files (SSH)."""
+def baseline_refresh(ctx: DeltaContext, name: str | None, force: bool,
+                     compress: bool | None, var: tuple[str, ...]) -> None:
+    """Refresh baseline files from device (SSH).
+
+    \b
+    Default: incremental — downloads new/changed, removes untracked.
+    Use --force for full re-download from scratch.
+
+    \b
+    Examples:
+      delta baseline refresh              # Incremental update
+      delta baseline refresh --force      # Full re-download
+    """
     ctx.require_init()
+    _apply_vars(ctx, var)
     lm = ctx.setup_logging("baseline_refresh")
     success = False
     try:
@@ -1260,7 +1290,7 @@ def baseline_refresh(ctx: DeltaContext, name: str | None, compress: bool | None)
         from delta.baseline_ops import refresh_baseline
         from delta.connection import Connection
         with Connection(config.ssh, config.transfer) as conn:
-            refresh_baseline(conn, ctx.storage, n, resolved_vars=ctx.var_map)
+            refresh_baseline(conn, ctx.storage, n, resolved_vars=ctx.var_map, force=force)
         ui.print_success(f"'{n}' refreshed.")
         success = True
     except (AbortedError, DeltaError) as e:
