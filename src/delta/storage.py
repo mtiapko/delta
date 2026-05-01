@@ -220,16 +220,32 @@ class Storage:
         return d
 
     def save_scan(self, scan: ScanResult) -> None:
+        import json
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.cache_dir / "scan.yaml", "w", encoding="utf-8") as f:
-            yaml.dump(scan.to_dict(), f, default_flow_style=False, sort_keys=False)
+        # JSON is ~50x faster to parse than YAML for large scan results
+        with open(self.cache_dir / "scan.json", "w", encoding="utf-8") as f:
+            json.dump(scan.to_dict(), f, separators=(",", ":"))
+        # Remove old YAML scan if exists
+        old = self.cache_dir / "scan.yaml"
+        if old.exists():
+            old.unlink()
 
     def load_scan(self) -> ScanResult | None:
-        path = self.cache_dir / "scan.yaml"
+        import json
+        path = self.cache_dir / "scan.json"
         if not path.exists():
+            # Backward compat: try old YAML format
+            yaml_path = self.cache_dir / "scan.yaml"
+            if yaml_path.exists():
+                with open(yaml_path, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+                # Auto-migrate to JSON
+                scan = ScanResult.from_dict(data)
+                self.save_scan(scan)
+                return scan
             return None
         with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = json.load(f)
         return ScanResult.from_dict(data)
 
     def clean_cache(self) -> None:

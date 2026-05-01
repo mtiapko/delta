@@ -24,6 +24,22 @@ from delta.models import FileInfo, SSHConfig, TransferConfig, TransferMethod
 logger = logging.getLogger("delta")
 
 
+def _restore_terminal() -> None:
+    """Restore terminal settings after SSH failure (e.g. passphrase timeout)."""
+    try:
+        import termios
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        attrs[3] |= termios.ECHO | termios.ICANON
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception:
+        # Fallback: stty sane
+        try:
+            subprocess.run(["stty", "sane"], stdin=sys.stdin, check=False)
+        except Exception:
+            pass
+
+
 class Connection:
     """Manages an SSH ControlMaster connection to a device."""
 
@@ -76,13 +92,18 @@ class Connection:
                     f"Failed to connect to {self._ssh.host}: {stderr}"
                 )
         except subprocess.TimeoutExpired:
+            _restore_terminal()
             raise ConnectionError(
                 f"Connection to {self._ssh.host} timed out after {self._ssh.connect_timeout}s"
             )
         except FileNotFoundError:
+            _restore_terminal()
             raise ConnectionError(
                 "ssh binary not found. Ensure OpenSSH client is installed."
             )
+        except Exception:
+            _restore_terminal()
+            raise
 
         self._connected = True
         ui.print_success(f"Connected to {self._ssh.host}.")

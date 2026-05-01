@@ -348,6 +348,16 @@ def diff(ctx: DeltaContext, paths: tuple[str, ...], against_name: str,
         diff_result = compare_with_reference(
             ctx.storage, scan, ref_name, ref_type, list(extra_ignore) or None)
 
+        # Exclude staged files (like git diff — shows only unstaged)
+        manifest = ctx.storage.load_staging()
+        if not manifest.is_empty:
+            diff_result.modified = [f for f in diff_result.modified
+                                    if f.path not in manifest.modified]
+            diff_result.created = [f for f in diff_result.created
+                                   if f.path not in manifest.created]
+            diff_result.deleted = [p for p in diff_result.deleted
+                                   if p not in manifest.deleted]
+
         if not diff_result.has_changes:
             ui.print_success("No changes detected.")
             return
@@ -702,8 +712,11 @@ def commit_cmd(ctx: DeltaContext, yes: bool) -> None:
 @click.argument("target")
 @click.argument("name", required=False, default="")
 @click.option("--scaffold", is_flag=True, help="Add commented examples of all fields.")
+@click.option("--from", "from_source", default="",
+              type=click.Choice(["", "staging", "cache", "ref"], case_sensitive=False),
+              help="Force source: staging, cache, or ref (reference).")
 @pass_ctx
-def edit(ctx: DeltaContext, target: str, name: str, scaffold: bool) -> None:
+def edit(ctx: DeltaContext, target: str, name: str, scaffold: bool, from_source: str) -> None:
     """Edit a file or metadata.
 
     \b
@@ -711,17 +724,20 @@ def edit(ctx: DeltaContext, target: str, name: str, scaffold: bool) -> None:
     Otherwise → open metadata/config in editor.
 
     \b
+    Source priority (for files): staging → reference (patch/baseline) → cache.
+    Use --from to override.
+
+    \b
     Examples:
-      delta edit /etc/config.conf       # Edit file, auto-stage
-      delta edit config                 # Edit config.yaml
-      delta edit patch [name]           # Edit patch metadata
-      delta edit baseline [name]        # Edit baseline metadata
-      delta edit template name          # Edit/create template
+      delta edit /etc/config.conf              # Auto-detect source
+      delta edit /etc/config.conf --from cache # Force from device cache
+      delta edit config                        # Edit config.yaml
+      delta edit patch [name]                  # Edit patch metadata
     """
     ctx.require_init()
 
     if target.startswith("/"):
-        _edit_and_stage_file(ctx, target)
+        _edit_and_stage_file(ctx, target, from_source=from_source)
         return
 
     config = ctx.get_config()
@@ -750,7 +766,7 @@ def edit(ctx: DeltaContext, target: str, name: str, scaffold: bool) -> None:
         sys.exit(1)
 
 
-def _edit_and_stage_file(ctx: DeltaContext, remote_path: str) -> None:
+def _edit_and_stage_file(ctx: DeltaContext, remote_path: str, *, from_source: str = "") -> None:
     import tempfile
     state = ctx.get_state()
     ref_name = state.active
@@ -764,25 +780,39 @@ def _edit_and_stage_file(ctx: DeltaContext, remote_path: str) -> None:
         ui.print_error("No editor.")
         sys.exit(1)
 
-    # Find source: staging > cache > reference
+    # Find reference file (for comparing after edit)
+    from delta.diff_ops import _resolve_entity_file
+    ref_file = _resolve_entity_file(ctx.storage, ref_name, ref_type, remote_path)
+    ref_content = ref_file.read_bytes() if ref_file and ref_file.exists() else None
+
     manifest = ctx.storage.load_staging()
+
+    # Resolve source to edit
     src = None
     source_label = ""
-    if manifest.has_file(remote_path):
-        src = ctx.storage.resolve_staged_file(manifest, remote_path)
-        if src:
-            source_label = "staging"
-    if not src:
-        # Try cache
-        cache_path = ctx.storage.cache_files_dir / remote_path.lstrip("/")
-        if cache_path.exists():
-            src = cache_path
-            source_label = "cache"
-    if not src:
-        from delta.diff_ops import _resolve_entity_file
-        src = _resolve_entity_file(ctx.storage, ref_name, ref_type, remote_path)
-        if src:
-            source_label = f"{ref_type.value}/{ref_name}"
+
+    if from_source == "staging":
+        src = ctx.storage.resolve_staged_file(manifest, remote_path) if manifest.has_file(remote_path) else None
+        source_label = "staging" if src else ""
+    elif from_source == "cache":
+        p = ctx.storage.cache_files_dir / remote_path.lstrip("/")
+        if p.exists():
+            src, source_label = p, "cache"
+    elif from_source == "ref":
+        if ref_file and ref_file.exists():
+            src, source_label = ref_file, f"{ref_type.value}/{ref_name}"
+    else:
+        # Default priority: staging → reference → cache
+        if manifest.has_file(remote_path):
+            src = ctx.storage.resolve_staged_file(manifest, remote_path)
+            if src:
+                source_label = "staging"
+        if not src and ref_file and ref_file.exists():
+            src, source_label = ref_file, f"{ref_type.value}/{ref_name}"
+        if not src:
+            p = ctx.storage.cache_files_dir / remote_path.lstrip("/")
+            if p.exists():
+                src, source_label = p, "cache"
 
     with tempfile.NamedTemporaryFile(suffix="_" + os.path.basename(remote_path),
                                      mode="w", delete=False) as tmp:
@@ -793,12 +823,30 @@ def _edit_and_stage_file(ctx: DeltaContext, remote_path: str) -> None:
         else:
             ui.print_info(f"Creating new file: {remote_path}")
 
-    original = tmp_path.read_bytes() if tmp_path.exists() else b""
+    pre_edit = tmp_path.read_bytes() if tmp_path.exists() else b""
     os.system(f"{editor_cmd} {tmp_path}")
-    if not tmp_path.exists() or tmp_path.read_bytes() == original:
+
+    if not tmp_path.exists():
+        ui.print_info("No changes.")
+        return
+
+    post_edit = tmp_path.read_bytes()
+    if post_edit == pre_edit:
         ui.print_info("No changes.")
         tmp_path.unlink(missing_ok=True)
         return
+
+    # Compare against reference: if restored to original → unstage
+    if ref_content is not None and post_edit == ref_content:
+        if manifest.has_file(remote_path):
+            from delta.staging_ops import stage_remove
+            stage_remove(ctx.storage, [remote_path])
+            ui.print_info("Restored to reference — removed from staging.")
+        else:
+            ui.print_info("Content matches reference — nothing to stage.")
+        tmp_path.unlink(missing_ok=True)
+        return
+
     from delta.staging_ops import stage_add_local
     stage_add_local(ctx.storage, remote_path, tmp_path, ref_name, ref_type)
     tmp_path.unlink(missing_ok=True)
@@ -1809,9 +1857,9 @@ def cache_cmd(ctx: DeltaContext, action: str, yes: bool) -> None:
     ctx.require_init()
     _apply_yes(ctx, yes)
     cache_dir = ctx.storage.cache_files_dir
-    scan_file = ctx.storage.delta_dir / "cache" / "scan.yaml"
-
-    has_cache = cache_dir.exists() or scan_file.exists()
+    scan_files = [ctx.storage.delta_dir / "cache" / n for n in ("scan.json", "scan.yaml")]
+    has_scan = any(f.exists() for f in scan_files)
+    has_cache = cache_dir.exists() or has_scan
     if not has_cache:
         ui.print_info("Cache is empty.")
         return
@@ -1833,8 +1881,9 @@ def cache_cmd(ctx: DeltaContext, action: str, yes: bool) -> None:
     import shutil
     if cache_dir.exists():
         shutil.rmtree(cache_dir)
-    if scan_file.exists():
-        scan_file.unlink()
+    for sf in scan_files:
+        if sf.exists():
+            sf.unlink()
     ui.print_success("Cache cleared.")
 
 
@@ -1967,9 +2016,9 @@ def export_patch(ctx: DeltaContext, name: str | None, out_dir: str) -> None:
 
     meta = ctx.storage.load_patch(patch_name)
     with tarfile.open(archive, "w:gz") as tar:
-        for f in patch_dir.rglob("*"):
+        for f in sorted(patch_dir.rglob("*")):
             arcname = f"{patch_name}/{f.relative_to(patch_dir)}"
-            tar.add(f, arcname=arcname)
+            tar.add(f, arcname=arcname, recursive=False)
 
     total = len(meta.modified_files) + len(meta.created_files) + len(meta.deleted_files)
     ui.print_success(f"Exported '{patch_name}' → {archive}")

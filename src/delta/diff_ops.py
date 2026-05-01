@@ -369,13 +369,14 @@ def _build_reference_checksums(
         files_dir = storage.baseline_files_dir(ref_name)
         meta = storage.load_baseline(ref_name)
         checksums.update(meta.symlink_targets)
+        # Use cached checksums (baseline can have thousands of files)
+        checksums.update(_load_or_compute_checksums(storage, ref_name, files_dir))
     else:
         pm = storage.load_patch(ref_name)
         try:
             base_dir = storage.baseline_files_dir(pm.baseline)
-            for f in base_dir.rglob("*"):
-                if f.is_file():
-                    checksums["/" + str(f.relative_to(base_dir))] = compute_local_md5(f)
+            base_checksums = _load_or_compute_checksums(storage, pm.baseline, base_dir)
+            checksums.update(base_checksums)
             base_meta = storage.load_baseline(pm.baseline)
             checksums.update(base_meta.symlink_targets)
         except Exception:
@@ -384,10 +385,46 @@ def _build_reference_checksums(
         for rpath in pm.deleted_files:
             checksums.pop(rpath, None)
         checksums.update(pm.symlink_targets)
+        # Patch files — usually few, compute directly
+        for f in files_dir.rglob("*"):
+            if f.is_file():
+                checksums["/" + str(f.relative_to(files_dir))] = compute_local_md5(f)
+    return checksums
 
+
+def _load_or_compute_checksums(storage: Storage, name: str, files_dir: Path) -> dict[str, str]:
+    """Load cached checksums or compute and cache them."""
+    import json
+    cache_path = storage._baseline_dir(name) / ".checksums.json"
+
+    # Check if cache is valid (exists and newer than any file)
+    if cache_path.exists():
+        cache_mtime = cache_path.stat().st_mtime
+        # Quick check: if any file is newer, invalidate
+        stale = False
+        for f in files_dir.rglob("*"):
+            if f.is_file() and f.stat().st_mtime > cache_mtime:
+                stale = True
+                break
+        if not stale:
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+
+    # Compute and cache
+    checksums: dict[str, str] = {}
     for f in files_dir.rglob("*"):
         if f.is_file():
             checksums["/" + str(f.relative_to(files_dir))] = compute_local_md5(f)
+
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(checksums, f, separators=(",", ":"))
+    except Exception:
+        pass
+
     return checksums
 
 
