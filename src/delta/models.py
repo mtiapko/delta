@@ -400,6 +400,7 @@ class PatchMetadata:
     created_files: list[str] = field(default_factory=list)
     deleted_files: list[str] = field(default_factory=list)
     symlink_targets: dict[str, str] = field(default_factory=dict)  # path→target for symlinks
+    hash: str = ""  # Cached content hash, updated on commit
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {
@@ -414,6 +415,8 @@ class PatchMetadata:
             "created_files": self.created_files,
             "deleted_files": self.deleted_files,
         }
+        if self.hash:
+            d["hash"] = self.hash
         if self.symlink_targets:
             d["symlink_targets"] = self.symlink_targets
         if not self.on_fetch.is_empty:
@@ -440,6 +443,7 @@ class PatchMetadata:
             created_files=d.get("created_files", []),
             deleted_files=d.get("deleted_files", []),
             symlink_targets=d.get("symlink_targets", {}),
+            hash=d.get("hash", ""),
         )
 
 

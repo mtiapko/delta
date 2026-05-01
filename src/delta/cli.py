@@ -1432,11 +1432,12 @@ def patch_info(ctx: DeltaContext, args: tuple[str, ...], detailed: bool, show_ha
         sys.exit(1)
 
     if show_hash:
-        click.echo(ctx.storage.compute_patch_hash(n))
+        m = ctx.storage.load_patch(n)
+        click.echo(m.hash or ctx.storage.compute_patch_hash(n))
         return
 
     m = ctx.storage.load_patch(n)
-    patch_hash = ctx.storage.compute_patch_hash(n)
+    patch_hash = m.hash or ctx.storage.compute_patch_hash(n)
     ui.print_header(f"Patch: {m.name}")
     ui.print_info(f"Hash: {patch_hash}")
     if m.description:
@@ -1845,14 +1846,17 @@ def config_set(ctx: DeltaContext, key: str, value: str) -> None:
 
 @main.command("cache")
 @click.argument("action", type=click.Choice(["clean"]))
+@click.option("--all", "-a", "clean_all", is_flag=True,
+              help="Also remove internal JSON caches (checksums, metadata).")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation.")
 @pass_ctx
-def cache_cmd(ctx: DeltaContext, action: str, yes: bool) -> None:
-    """Manage cached data from fetch.
+def cache_cmd(ctx: DeltaContext, action: str, clean_all: bool, yes: bool) -> None:
+    """Manage cached data.
 
     \b
     Examples:
-      delta cache clean          # Remove all cached scan data and files
+      delta cache clean          # Remove fetched scan data and files
+      delta cache clean --all    # Also rebuild checksums and metadata caches
     """
     ctx.require_init()
     _apply_yes(ctx, yes)
@@ -1860,30 +1864,43 @@ def cache_cmd(ctx: DeltaContext, action: str, yes: bool) -> None:
     scan_files = [ctx.storage.delta_dir / "cache" / n for n in ("scan.json", "scan.yaml")]
     has_scan = any(f.exists() for f in scan_files)
     has_cache = cache_dir.exists() or has_scan
-    if not has_cache:
+    if not has_cache and not clean_all:
         ui.print_info("Cache is empty.")
         return
 
-    # Calculate size
-    total_size = 0
-    file_count = 0
+    total_size, file_count = 0, 0
     if cache_dir.exists():
         for f in cache_dir.rglob("*"):
             if f.is_file():
                 total_size += f.stat().st_size
                 file_count += 1
 
-    ui.confirm_or_abort(
-        f"Remove cache ({file_count} files, {ui.format_size(total_size)})?",
-        auto_yes=ctx.auto_yes,
-    )
+    label = f"Remove cache ({file_count} files, {ui.format_size(total_size)})"
+    if clean_all:
+        label += " + rebuild internal caches"
+    ui.confirm_or_abort(f"{label}?", auto_yes=ctx.auto_yes)
 
-    import shutil
+    import shutil as _shutil
     if cache_dir.exists():
-        shutil.rmtree(cache_dir)
+        _shutil.rmtree(cache_dir)
     for sf in scan_files:
         if sf.exists():
             sf.unlink()
+
+    if clean_all:
+        # Remove all .metadata_cache.json and .checksums.json
+        removed = 0
+        for d in (ctx.storage.delta_dir / "baselines", ctx.storage.delta_dir / "patches"):
+            if d.exists():
+                for f in d.rglob(".metadata_cache.json"):
+                    f.unlink()
+                    removed += 1
+                for f in d.rglob(".checksums.json"):
+                    f.unlink()
+                    removed += 1
+        if removed:
+            ui.print_info(f"Removed {removed} internal cache files.")
+
     ui.print_success("Cache cleared.")
 
 

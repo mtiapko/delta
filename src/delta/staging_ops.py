@@ -322,6 +322,7 @@ def commit_to_patch(storage: Storage, patch_name: str) -> PatchMetadata:
             meta.ownership = compute_ownership(relevant)
 
     meta.updated_at = datetime.now().isoformat()
+    meta.hash = storage.compute_patch_hash(patch_name)
     storage.save_patch(meta)
     storage.clear_staging()
 
