@@ -116,18 +116,40 @@ class Storage:
         return d
 
     def save_baseline(self, meta: BaselineMetadata) -> None:
+        import json as _json
         d = self._baseline_dir(meta.name)
         d.mkdir(parents=True, exist_ok=True)
+        data = meta.to_dict()
         with open(d / "metadata.yaml", "w", encoding="utf-8") as f:
-            yaml.dump(meta.to_dict(), f, default_flow_style=False, sort_keys=False)
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        # JSON cache for fast loading
+        with open(d / ".metadata_cache.json", "w", encoding="utf-8") as f:
+            _json.dump(data, f, separators=(",", ":"))
 
     def load_baseline(self, name: str) -> BaselineMetadata:
-        path = self._baseline_dir(name) / "metadata.yaml"
-        if not path.exists():
+        import json as _json
+        d = self._baseline_dir(name)
+        yaml_path = d / "metadata.yaml"
+        json_path = d / ".metadata_cache.json"
+        if not yaml_path.exists():
             raise NotFoundError(f"Baseline '{name}' not found.")
-        with open(path, "r", encoding="utf-8") as f:
+        # Use JSON cache if valid (newer than YAML)
+        if json_path.exists() and json_path.stat().st_mtime >= yaml_path.stat().st_mtime:
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    return BaselineMetadata.from_dict(_json.load(f))
+            except Exception:
+                pass
+        # Fallback: parse YAML and rebuild cache
+        with open(yaml_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        return BaselineMetadata.from_dict(data)
+        meta = BaselineMetadata.from_dict(data)
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                _json.dump(data, f, separators=(",", ":"))
+        except Exception:
+            pass
+        return meta
 
     def get_baseline_file(self, name: str, remote_path: str) -> Path:
         return self.baseline_files_dir(name) / remote_path.lstrip("/")
@@ -167,18 +189,37 @@ class Storage:
         return d
 
     def save_patch(self, meta: PatchMetadata) -> None:
+        import json as _json
         d = self._patch_dir(meta.name)
         d.mkdir(parents=True, exist_ok=True)
+        data = meta.to_dict()
         with open(d / "metadata.yaml", "w", encoding="utf-8") as f:
-            yaml.dump(meta.to_dict(), f, default_flow_style=False, sort_keys=False)
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        with open(d / ".metadata_cache.json", "w", encoding="utf-8") as f:
+            _json.dump(data, f, separators=(",", ":"))
 
     def load_patch(self, name: str) -> PatchMetadata:
-        path = self._patch_dir(name) / "metadata.yaml"
-        if not path.exists():
+        import json as _json
+        d = self._patch_dir(name)
+        yaml_path = d / "metadata.yaml"
+        json_path = d / ".metadata_cache.json"
+        if not yaml_path.exists():
             raise NotFoundError(f"Patch '{name}' not found.")
-        with open(path, "r", encoding="utf-8") as f:
+        if json_path.exists() and json_path.stat().st_mtime >= yaml_path.stat().st_mtime:
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    return PatchMetadata.from_dict(_json.load(f))
+            except Exception:
+                pass
+        with open(yaml_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        return PatchMetadata.from_dict(data)
+        meta = PatchMetadata.from_dict(data)
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                _json.dump(data, f, separators=(",", ":"))
+        except Exception:
+            pass
+        return meta
 
     def get_patch_file(self, name: str, remote_path: str) -> Path:
         return self.patch_files_dir(name) / remote_path.lstrip("/")
