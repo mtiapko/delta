@@ -346,9 +346,11 @@ def _matches_paths(file_path: str, filter_paths: list[str]) -> bool:
     - Directory prefix: /etc/ or /etc
     - Glob patterns: /etc/*.conf (single * does NOT cross /)
     - Recursive glob: /etc/**/*.json
+    - Basename glob: *.conf (matches any /path/to/file.conf)
     """
-    import fnmatch
     import re
+
+    basename = file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path
 
     for p in filter_paths:
         if file_path == p:
@@ -358,11 +360,14 @@ def _matches_paths(file_path: str, filter_paths: list[str]) -> bool:
             if _matches_recursive_glob(file_path, p):
                 return True
         elif "*" in p or "?" in p:
-            # Convert glob to regex where * doesn't cross /
-            # * → [^/]*, ? → [^/]
             regex = re.escape(p).replace(r"\*", "[^/]*").replace(r"\?", "[^/]")
             if re.fullmatch(regex, file_path):
                 return True
+            # If pattern has no /, match against basename
+            if "/" not in p:
+                base_regex = re.escape(p).replace(r"\*", "[^/]*").replace(r"\?", "[^/]")
+                if re.fullmatch(base_regex, basename):
+                    return True
         elif file_path.startswith(p.rstrip("/") + "/"):
             return True
     return False

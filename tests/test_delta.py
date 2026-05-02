@@ -1470,3 +1470,56 @@ class TestDeletedFilesBug:
         commit_to_patch(storage, "p1")
         m = storage.load_patch("p1")
         assert "/etc/old.conf" in m.deleted_files
+
+
+class TestPatchDrop:
+    def test_drop_file(self, storage):
+        from delta.staging_ops import create_patch, commit_to_patch
+        storage.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
+        storage.save_state(DeltaState(active="bl"))
+        create_patch(storage, "p1")
+
+        # Add and commit a file
+        storage.save_staging(StagingManifest(
+            reference="bl", created=["/etc/a.conf"],
+            sources={"/etc/a.conf": "local"}))
+        sf = storage.get_staging_file("/etc/a.conf")
+        sf.parent.mkdir(parents=True, exist_ok=True)
+        sf.write_text("content")
+        commit_to_patch(storage, "p1")
+
+        m = storage.load_patch("p1")
+        assert "/etc/a.conf" in m.created_files
+
+        # Set active to patch
+        storage.save_state(DeltaState(active="p1"))
+
+        # Drop via CLI
+        from click.testing import CliRunner
+        from delta.cli import main
+        r = CliRunner().invoke(main, ["-C", str(storage.delta_dir.parent),
+                                       "patch", "drop", "-y", "/etc/a.conf"])
+        assert r.exit_code == 0
+        m = storage.load_patch("p1")
+        assert "/etc/a.conf" not in m.created_files
+        assert not (storage.patch_files_dir("p1") / "etc" / "a.conf").exists()
+
+    def test_drop_glob(self, storage):
+        from delta.staging_ops import create_patch
+        storage.save_baseline(BaselineMetadata(name="bl", tracked_paths=["/etc"]))
+        storage.save_state(DeltaState(active="bl"))
+        create_patch(storage, "p1")
+        m = storage.load_patch("p1")
+        m.modified_files = ["/etc/a.conf", "/etc/b.conf", "/etc/c.py"]
+        storage.save_patch(m)
+        storage.save_state(DeltaState(active="p1"))
+
+        from click.testing import CliRunner
+        from delta.cli import main
+        r = CliRunner().invoke(main, ["-C", str(storage.delta_dir.parent),
+                                       "patch", "drop", "-y", "*.conf"])
+        assert r.exit_code == 0
+        m = storage.load_patch("p1")
+        assert "/etc/a.conf" not in m.modified_files
+        assert "/etc/b.conf" not in m.modified_files
+        assert "/etc/c.py" in m.modified_files

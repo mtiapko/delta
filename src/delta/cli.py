@@ -1482,6 +1482,64 @@ def patch_info(ctx: DeltaContext, args: tuple[str, ...], detailed: bool, show_ha
                                 f"baseline/{m.baseline}", f"patch/{n}",
                                 show_binary=binary)
 
+@patch.command("drop")
+@click.argument("paths", nargs=-1, required=True)
+@click.option("--name", "-n", default="", help="Patch name (default: active).")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation.")
+@pass_ctx
+def patch_drop(ctx: DeltaContext, paths: tuple[str, ...], name: str, yes: bool) -> None:
+    """Remove files from a committed patch.
+
+    \b
+    Examples:
+      delta patch drop /etc/old.conf
+      delta patch drop "/etc/*.tmp"
+      delta patch drop /etc/old.conf -n wifi
+    """
+    ctx.require_init()
+    _apply_yes(ctx, yes)
+    from delta.staging_ops import _matches_paths
+
+    n = name or ctx.get_state().active
+    if not n:
+        ui.print_error("No patch specified or active.")
+        sys.exit(1)
+    if ctx.storage.get_entity_type(n) != EntityType.PATCH:
+        ui.print_error(f"'{n}' is not a patch.")
+        sys.exit(1)
+
+    meta = ctx.storage.load_patch(n)
+    patch_files_dir = ctx.storage.patch_files_dir(n)
+    filter_paths = list(paths)
+
+    all_files = list(meta.modified_files) + list(meta.created_files) + list(meta.deleted_files)
+    to_drop = [p for p in all_files if _matches_paths(p, filter_paths)]
+
+    if not to_drop:
+        ui.print_warning("No matching files in patch.")
+        return
+
+    ui.print_info(f"Will drop from '{n}':")
+    for rpath in sorted(to_drop):
+        ui.print_file_change("D", rpath)
+    ui.confirm_or_abort(f"Drop {len(to_drop)} files?", auto_yes=ctx.auto_yes)
+
+    for rpath in to_drop:
+        if rpath in meta.modified_files:
+            meta.modified_files.remove(rpath)
+        if rpath in meta.created_files:
+            meta.created_files.remove(rpath)
+        if rpath in meta.deleted_files:
+            meta.deleted_files.remove(rpath)
+        f = patch_files_dir / rpath.lstrip("/")
+        if f.exists():
+            f.unlink()
+
+    meta.symlink_targets = {k: v for k, v in meta.symlink_targets.items() if k not in to_drop}
+    ctx.storage.save_patch(meta)
+    ui.print_success(f"{len(to_drop)} files dropped from '{n}'.")
+
+
 @patch.command("rm")
 @click.argument("name")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation.")
