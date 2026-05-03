@@ -509,9 +509,9 @@ def status(ctx: DeltaContext, paths: tuple[str, ...], show_all: bool, show_ignor
         if unstaged_mod or unstaged_new or unstaged_del:
             threshold = 0 if show_all else 3
             ui.print_info("\nChanges not staged for commit:")
-            _print_compressed(unstaged_mod, "M", threshold=threshold)
-            _print_compressed(unstaged_new, "A", threshold=threshold)
-            _print_compressed(unstaged_del, "D", threshold=threshold)
+            _print_compressed(unstaged_mod, "M", threshold=threshold, filter_paths=filter_paths)
+            _print_compressed(unstaged_new, "A", threshold=threshold, filter_paths=filter_paths)
+            _print_compressed(unstaged_del, "D", threshold=threshold, filter_paths=filter_paths)
         elif manifest.is_empty and not filter_paths:
             ui.print_success("No changes vs reference.")
     elif not scan:
@@ -532,10 +532,13 @@ def status(ctx: DeltaContext, paths: tuple[str, ...], show_all: bool, show_ignor
             ui.print_info("\nNo ignore patterns.")
 
 
-def _print_compressed(paths: list[str], change_type: str, threshold: int = 3) -> None:
+def _print_compressed(paths: list[str], change_type: str, threshold: int = 3,
+                      filter_paths: list[str] | None = None) -> None:
     """Print paths, collapsing directories with many files of same type.
 
     threshold=0 disables compression (show all individually).
+    If filter_paths given, don't compress directories that match the filter
+    (user explicitly asked about them).
     """
     if not paths:
         return
@@ -551,9 +554,21 @@ def _print_compressed(paths: list[str], change_type: str, threshold: int = 3) ->
         parent = os.path.dirname(p) or "/"
         by_dir[parent].append(p)
 
+    # Determine which directories are explicitly requested
+    requested_dirs: set[str] = set()
+    if filter_paths:
+        for fp in filter_paths:
+            # /etc/ or /etc → this dir is explicitly requested
+            clean = fp.rstrip("/")
+            if "/" in clean and "*" not in clean and "?" not in clean:
+                requested_dirs.add(clean)
+
     shown: set[str] = set()
     for parent in sorted(by_dir.keys()):
         files = by_dir[parent]
+        # Don't compress if user explicitly asked about this directory
+        if parent in requested_dirs:
+            continue
         if len(files) >= threshold:
             ui.print_file_change(change_type, f"{parent}/  ({len(files)} files)")
             shown.update(files)
