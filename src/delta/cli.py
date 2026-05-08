@@ -1448,11 +1448,11 @@ def patch_info(ctx: DeltaContext, args: tuple[str, ...], detailed: bool, show_ha
 
     if show_hash:
         m = ctx.storage.load_patch(n)
-        click.echo(m.hash or ctx.storage.compute_patch_hash(n))
+        click.echo(ctx.storage.compute_patch_hash(n))
         return
 
     m = ctx.storage.load_patch(n)
-    patch_hash = m.hash or ctx.storage.compute_patch_hash(n)
+    patch_hash = ctx.storage.compute_patch_hash(n)
     ui.print_header(f"Patch: {m.name}")
     ui.print_info(f"Hash: {patch_hash}")
     if m.description:

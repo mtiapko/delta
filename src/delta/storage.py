@@ -498,14 +498,19 @@ class Storage:
             raise NotFoundError(f"Unknown edit target: '{target}'")
 
     def compute_patch_hash(self, name: str) -> str:
-        """Compute short hash of patch content (files + metadata)."""
+        """Compute short hash of patch content (files + metadata).
+
+        Excludes internal cache files (.metadata_cache.json, .checksums.json)
+        so the hash is stable regardless of cache state.
+        """
         import hashlib
         h = hashlib.md5()
         patch_dir = self._patch_dir(name)
         if not patch_dir.exists():
             return ""
+        _skip = {".metadata_cache.json", ".checksums.json"}
         for f in sorted(patch_dir.rglob("*")):
-            if f.is_file():
+            if f.is_file() and f.name not in _skip:
                 h.update(str(f.relative_to(patch_dir)).encode())
                 h.update(f.read_bytes())
         return h.hexdigest()[:12]
